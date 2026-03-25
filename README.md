@@ -1,6 +1,6 @@
 READ ME - Urchin Species Distribution Modelling
 
-Note- much of this code was adapted from a similar distribution modelling framework by Matt Csordas (primarily occurrence modelling) 
+Results and data are not included in this repository, as they are subject to data sharing agreements. Please refer to Rehill (2025) MSc thesis, available through the University of Victoria archives.
 
 Packages used: 
 tidyverse, cowplot, tidyterra, ggspatial, terra, sf, tidync, factoextra, viridis, ncmeta, readxl, dplyr, tidyr,lubridate, patchwork 
