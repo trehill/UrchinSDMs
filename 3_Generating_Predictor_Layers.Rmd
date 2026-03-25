@@ -1,0 +1,1530 @@
+---
+title: "ENV_Layers_wSCC"
+author: "Tessa Rehill" adapted code from Matt Csordas and Ashley Park
+date: "2025-03-03"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load required packages
+```{r}
+library(tidyverse)
+library(cowplot)
+library(tidyterra)
+library(ggspatial)
+library(terra)
+library(sf)
+library(tidync)
+library(factoextra)
+library(viridis)
+library(ncmeta)
+```
+
+# Import the Canadian 10 m topobathymetry layer and create a bathymetry layer that will be used to define my SDM domain
+```{r}
+#Load the DEM
+Raw_DEM <- terra::rast("./raw_data/West_Coast_DEM/WEST_COAST_DEM2.tif") 
+
+#Load my BC buffer
+BC_buffer <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project(terra::crs(Raw_DEM))
+
+#Clamp to values between 0 and 30 m depth and aggregate up to 100 m cells
+DEM_100 <- terra::clamp(Raw_DEM, upper = 3, lower = -30, value = FALSE) %>% terra::aggregate(fact = 10,fun = "mean", na.rm = TRUE) %>% terra::clamp(upper = 0, lower = -30, value = FALSE) %>% terra::mask(BC_buffer)
+
+
+#Output the final raster as a tif
+terra::writeRaster(DEM_100, "./processed_data/ENV_layers/DEM_100.tif", overwrite = TRUE)
+
+#Load the previously created DEM
+DEM_100 <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+```
+
+# Create a layer for slope at the same scale as the aggregated DEM
+```{r}
+#Calculate slope for the entire DEM
+Raw_Slope <- terra::terrain(Raw_DEM, "slope", unit = "degrees", neighbors = 8)
+
+#Resample slope values to the clamped DEM, aggregating by taking the mean of all values within a cell
+Slope_100 <- terra::resample(Raw_Slope, DEM_100, method = "average")
+
+#Save the final raster
+terra::writeRaster(Slope_100, "./processed_data/ENV_layers/Slope_100.tif", overwrite = TRUE)
+
+#Load the processed slope and aspect layers
+Slope_100 <- terra::rast("./processed_data/ENV_layers/Slope_100.tif")
+```
+
+# Load, combine, and aggregate the layers for relative wave exposure index 
+```{r}
+#Load the DFO REI model layers
+SOG_rei <- terra::rast("./raw_data/BC_DFO_Fetch/rei_sog.tif")
+WCVI_rei <- terra::rast("./raw_data/BC_DFO_Fetch/rei_wcvi.tif")
+QCS_rei <- terra::rast("./raw_data/BC_DFO_Fetch/rei_qcs.tif")
+NCC_rei <- terra::rast("./raw_data//BC_DFO_Fetch/rei_ncc.tif")
+HG_rei <- terra::rast("./raw_data//BC_DFO_Fetch/rei_hg.tif")
+
+#Combine, project, and mask to create an exposure layer for all of BC
+All_rei <- terra::mosaic(SOG_rei, WCVI_rei, QCS_rei, NCC_rei, HG_rei, fun = min) %>% terra::project(terra::crs(Raw_DEM)) %>% terra::mask(BC_buffer)
+
+#Resample this layer to the 100 m grid of the DEM by taking the average of all REI values within a DEM cell
+REI_100 <- terra::resample(All_rei, DEM_100, method = "average")
+
+#Save the final REI raster
+terra::writeRaster(REI_100, "./processed_data/ENV_layers/REI_100.tif", overwrite = TRUE)
+
+#Load back in the processed REI layer
+REI_100 <- terra::rast("./processed_data/ENV_layers/REI_100.tif")
+```
+
+# Load, combine and aggregate the Gregr substrate class model layers into a percent rock layer for the entire coast
+  #need to figure out where this source comes from ########################
+```{r}
+#Load the Gregr substrate layers
+SOG_sub <- terra::rast("./raw_data/Gregr_sub/SOG_substrate_20m.tif")
+WCVI_sub <- terra::rast("./raw_data/Gregr_sub/WCVI_substrate_20m.tif")
+QCS_sub <- terra::rast("./raw_data/Gregr_sub/QCS_substrate_20m.tif")
+NCC_sub <- terra::rast("./raw_data/Gregr_sub/NCC_substrate_20m.tif")
+HG_sub <- terra::rast("./raw_data/Gregr_sub/HG_substrate_20m.tif")
+
+#Combine, project, and mask to create an exposure layer for all of BC
+All_sub <- terra::mosaic(SOG_sub, WCVI_sub, QCS_sub, NCC_sub, HG_sub, fun = min) %>% terra::project(terra::crs(Raw_DEM)) %>% terra::mask(BC_buffer)
+
+#Create a layer only including cells classified as rock
+All_Rock <- terra::classify(All_sub, rcl = matrix(c(0.5, 1.5, 1,
+                                                   1.5, 2.5, 0,
+                                                   2.5, 3.5, 0,
+                                                   3.5, 4.5, 0), ncol = 3, byrow = TRUE), include.lowest = TRUE)
+
+#Resample this layer to the 100 m DEM by taking the average of all values in a 100 m cell to create a percent rock metric for each DEM grid cell
+Rock_100 <- terra::resample(All_Rock, DEM_100, method = "average")
+
+#Save the final percent rock raster
+terra::writeRaster(Rock_100, "./processed_data/ENV_layers/Rock_100.tif", overwrite = TRUE)
+
+#Load back in the final percent rock layer
+Rock_100 <- terra::rast("./processed_data/ENV_layers/Rock_100.tif")
+```
+
+#Current layer (aggregated current speed from best available tidal current models for entire coast)
+```{r}
+#Load in the current index
+Raw_Current <- terra::rast("./raw_data/Nearshore_CurrentSpeedIndex.tif")
+
+#Resample current index values to the clamped DEM, aggregating by taking the mean of all values within a cell
+Current_100 <- terra::resample(Raw_Current, DEM_100, method = "average") %>% terra::mask(BC_buffer)
+#Save the final current raster
+terra::writeRaster(Current_100, "./processed_data/ENV_layers/Current_100.tif", overwrite = TRUE)
+
+#Load back in the processed current layer
+Current_100 <- terra::rast("./processed_data/ENV_layers/Current_100.tif")
+```
+
+## Read in BCCM Data
+```{r}
+# the min and max for monthly values were calculated from the 3-day average values
+
+#### TALK ####
+#read in the nc file
+BCCM_h_TAlk_nc <- tidync::tidync("./raw_data/BCCM/hindcast/bcc42_run4_mon1993to2021_talk.nc")
+#Load in the data and grid
+BCCM_h_TAlk_data <- tidync::hyper_tibble(BCCM_h_TAlk_nc)
+BCCM_h_TAlk_data$months <- as.numeric(BCCM_h_TAlk_data$months)
+BCCM_h_TAlk_data <- BCCM_h_TAlk_data %>%
+  mutate(date = as.Date('1992-12-01') + months(months),
+         year = year(date),
+         month = month(date))
+BCCM_h_TAlk_grid <- BCCM_h_TAlk_nc %>% tidync::activate("D0,D1") %>% tidync::hyper_tibble()
+
+#### Salinity ####
+#read in the nc file
+BCCM_h_salt_nc <- tidync::tidync("./raw_data/BCCM/hindcast/bcc42_run4_mon1993to2021_salt.nc")
+#Load in the data and grid
+BCCM_h_salt_data <- tidync::hyper_tibble(BCCM_h_salt_nc)
+BCCM_h_salt_data$months <- as.numeric(BCCM_h_salt_data$months)
+BCCM_h_salt_data <- BCCM_h_salt_data %>%
+  mutate(date = as.Date('1992-12-01') + months(months),
+         year = year(date),
+         month = month(date))
+BCCM_h_salt_grid <- BCCM_h_salt_nc %>% tidync::activate("D0,D1") %>% tidync::hyper_tibble()
+
+
+#### DO ####
+#read in the nc file
+BCCM_h_do_nc <- tidync::tidync("./raw_data/BCCM/hindcast/bcc42_run4_mon1993to2021_Oxy.nc")
+#Load in the data and grid
+BCCM_h_do_data <- tidync::hyper_tibble(BCCM_h_do_nc)
+BCCM_h_do_data$months <- as.numeric(BCCM_h_do_data$months)
+BCCM_h_do_data <- BCCM_h_do_data %>%
+  mutate(date = as.Date('1992-12-01') + months(months),
+         year = year(date),
+         month = month(date))
+BCCM_h_do_grid <- BCCM_h_do_nc %>% tidync::activate("D0,D1") %>% tidync::hyper_tibble()
+
+#### Temperature ####
+#read in the nc file
+BCCM_h_temp_nc <- tidync::tidync("./raw_data/BCCM/hindcast/bcc42_run4_mon1993to2021_temp.nc")
+#Load in the data and grid
+BCCM_h_temp_data <- tidync::hyper_tibble(BCCM_h_temp_nc)
+BCCM_h_temp_data$months <- as.numeric(BCCM_h_temp_data$months)
+BCCM_h_temp_data <- BCCM_h_temp_data %>%
+  mutate(date = as.Date('1992-12-01') + months(months),
+         year = year(date),
+         month = month(date))
+BCCM_h_temp_grid <- BCCM_h_temp_nc %>% tidync::activate("D0,D1") %>% tidync::hyper_tibble()
+
+```
+
+#Salish Sea Cast layers Yearly data
+```{r}
+#### Yearly data for  TAlk, DO ####
+
+#read in the nc file
+SSC_dfo_yearmax_nc <- tidync::tidync("raw_data/DFO- SalishSeaCast/1986-2005 Hindcast/SalishSeaCast-VNR023_yearmax_grid_bgc_T_1986-2005.nc")
+SSC_dfo_yearmean_nc <- tidync::tidync("raw_data/DFO- SalishSeaCast/1986-2005 Hindcast/SalishSeaCast-VNR023_yearmean_grid_bgc_T_1986-2005.nc")
+SSC_dfo_yearmin_nc <- tidync::tidync("raw_data/DFO- SalishSeaCast/1986-2005 Hindcast/SalishSeaCast-VNR023_yearmin_grid_bgc_T_1986-2005.nc")
+
+# get time units
+time_units_attr <- ncmeta::nc_atts("raw_data/DFO- SalishSeaCast/1986-2005 Hindcast/SalishSeaCast-VNR023_yearmax_grid_bgc_T_1986-2005.nc", "time_counter") 
+time_units <- time_units_attr$value[time_units_attr$name == "units"]
+date_origin <- ymd(time_units$units)
+
+#Load in the data and grid
+# Consulting with Amber Holdsworth for the oxygen, a delta needs to be applied to lower the high oxygen values in the model.  The delta was computed from the median bias between the obs and model profiles = subtracted  35.88 mmol/m3 in all simulations.
+
+# Load and process the data
+# Apply oxygen bias correction (-35.88 mmol/m3 in all simulations)
+
+SSC_dfo_yearmax_data <- tidync::hyper_tibble(SSC_dfo_yearmax_nc)%>%
+  mutate(DOmax = dissolved_oxygen - 35.88) %>%
+  select(-c(dissolved_inorganic_carbon, dissolved_oxygen, ammonium, nitrate, PAR, total_alkalinity))%>%
+  mutate(across(c(deptht, x, y), as.numeric))
+
+SSC_dfo_yearmean_data <- tidync::hyper_tibble(SSC_dfo_yearmean_nc)%>%
+  mutate(DOmean = dissolved_oxygen - 35.88) %>%
+  rename(TAlkmean = total_alkalinity) %>%
+  select(-c(dissolved_inorganic_carbon, dissolved_oxygen, PAR, ammonium, nitrate))%>%
+  mutate(across(c(deptht, x, y), as.numeric))
+
+SSC_dfo_yearmin_data <- tidync::hyper_tibble(SSC_dfo_yearmin_nc)%>%
+  mutate(DOmin = dissolved_oxygen - 35.88) %>%
+  select(-c(dissolved_inorganic_carbon, ammonium, nitrate, dissolved_oxygen, PAR, total_alkalinity)) %>%
+  mutate(across(c(deptht, x, y), as.numeric))
+
+SSC_dfo_year_data <- SSC_dfo_yearmax_data %>%
+  full_join(SSC_dfo_yearmean_data, by = join_by(x, y, deptht, time_counter)) %>%
+  full_join(SSC_dfo_yearmin_data, by = join_by(x, y, deptht, time_counter)) %>%
+  mutate(year = year(as.POSIXct(time_counter, origin = date_origin, tz = "UTC"))) %>%
+  filter(deptht > 0 & deptht < 30) 
+
+
+# Grid
+SSC_dfo_year_grid <- SSC_dfo_yearmax_nc %>% tidync::activate("D2,D3") %>% tidync::hyper_tibble()%>%
+  mutate(across(c(x, y), as.numeric))
+
+
+#### ubc TAlk, DO####
+# read in csvs
+
+SSC_ubc_DO_sur_csv <- read.csv("raw_data/DFO- SalishSeaCast/2007-2023 Current (V21-11)/DO_Surf_AnnualMeanMinMax.csv") %>%  mutate(deptht = 0.5)
+SSC_ubc_DO_10_csv <- read.csv("raw_data/DFO- SalishSeaCast//2007-2023 Current (V21-11)/DO_9pt5_AnnualMeanMinMax.csv") %>% mutate(deptht = 9.5)
+SSC_ubc_DO_csv <-bind_rows(SSC_ubc_DO_sur_csv, SSC_ubc_DO_10_csv)  %>% rename (DOmean = DO_mean, DOmin = DO_min, DOmax = DO_max)
+
+
+SSC_ubc_alk_sur_csv <- read.csv("raw_data/DFO- SalishSeaCast//2007-2023 Current (V21-11)/TA_Surf_AnnualMean.csv") %>%  mutate(deptht = 0.5)
+SSC_ubc_alk_10_csv <- read.csv("raw_data/DFO- SalishSeaCast//2007-2023 Current (V21-11)/TA_9pt5_AnnualMean.csv") %>% mutate(deptht = 9.5)
+SSC_ubc_alk_csv <-bind_rows(SSC_ubc_alk_sur_csv, SSC_ubc_alk_10_csv)  %>% rename (TAlkmean = TA_mean) 
+
+# get x and y from dfo grid to be able to join ubc and dfo data
+dfo_grid <- SSC_dfo_year_grid %>%  rename(longitude = nav_lon, latitude = nav_lat)
+
+SSC_ubc_year_data <- SSC_ubc_DO_csv %>% 
+  left_join(dfo_grid, by = join_by(longitude, latitude)) %>%
+  left_join(SSC_ubc_alk_csv, by = join_by(longitude, latitude, time, deptht)) %>% 
+  mutate(year = year(time), time_counter = NA) %>%
+  select(-c(time, latitude, longitude))%>%
+  mutate(across(c( x, y), as.numeric))
+
+#bind ubc and dfo data
+SSC_year_data <-bind_rows(SSC_ubc_year_data, SSC_dfo_year_data) 
+
+summary(SSC_year_data) #note NO 2006 data for salish sea cast 
+```
+
+#Salish Sea Cast Monthly data 
+```{r}
+#### SalishSeaCast Monthly data for temperature and salinity####
+
+# DFO temp and salt
+#read in the nc file
+SSC_dfo_monthmax_nc <- tidync::tidync("raw_data/DFO- SalishSeaCast//1986-2005 Hindcast/SalishSeaCast-VNR023_monmax_grid_T_1986-2005.nc")
+SSC_dfo_monthmean_nc <- tidync::tidync("raw_data/DFO- SalishSeaCast//1986-2005 Hindcast/SalishSeaCast-VNR023_monmean_grid_T_1986-2005.nc")
+SSC_dfo_monthmin_nc <- tidync::tidync("raw_data/DFO- SalishSeaCast//1986-2005 Hindcast/SalishSeaCast-VNR023_monmin_grid_T_1986-2005.nc")
+
+# get time units
+time_units_attr <- ncmeta::nc_atts("raw_data/DFO- SalishSeaCast/1986-2005 Hindcast/SalishSeaCast-VNR023_monmax_grid_T_1986-2005.nc", "time_counter") 
+time_units <- time_units_attr$value[time_units_attr$name == "units"]
+date_origin <- ymd(time_units$units)
+
+#Load in the data and grid
+SSC_dfo_monthmax_data <- tidync::hyper_tibble(SSC_dfo_monthmax_nc, force = TRUE)%>%
+  rename(tempmax = votemper, saltmax = vosaline) %>%
+  mutate(across(c(deptht, x, y), as.numeric))
+
+SSC_dfo_monthmean_data <- tidync::hyper_tibble(SSC_dfo_monthmean_nc, force = TRUE)%>%
+  rename(tempmean = votemper, saltmean = vosaline) %>%
+  mutate(across(c(deptht, x, y), as.numeric))
+
+SSC_dfo_monthmin_data <- tidync::hyper_tibble(SSC_dfo_monthmin_nc, force = TRUE)%>%
+  rename(tempmin = votemper, saltmin = vosaline) %>%
+  mutate(across(c(deptht, x, y), as.numeric))
+
+SSC_dfo_month_data <- SSC_dfo_monthmax_data %>%
+  full_join(SSC_dfo_monthmean_data, by = join_by(x, y, deptht, time_counter)) %>%
+  full_join(SSC_dfo_monthmin_data, by = join_by(x, y, deptht, time_counter)) %>%
+  mutate(year = year(as.POSIXct(time_counter, origin = date_origin, tz = "UTC"))) %>%
+  filter(deptht > 0 & deptht < 30)%>%
+  select(-c(saltmax, saltmin))
+
+#grid 
+SSC_dfo_month_grid <- SSC_dfo_monthmean_nc %>% tidync::activate("D2,D3") %>% tidync::hyper_tibble()%>%
+  mutate(across(c(x, y), as.numeric))
+
+#ubc temp and salinity
+SSC_ubc_salt_sur_csv <- read.csv("raw_data/DFO- SalishSeaCast//2007-2023 Current (V21-11)/Salinity_Surf_MonthlyMean.csv") %>%  mutate(deptht = 0.5)
+SSC_ubc_salt_10_csv <- read.csv("raw_data/DFO- SalishSeaCast//2007-2023 Current (V21-11)/Salinity_9pt5_MonthlyMean.csv") %>%  mutate(deptht = 9.5)
+SSC_ubc_salt_csv <-bind_rows(SSC_ubc_salt_sur_csv, SSC_ubc_salt_10_csv)  %>% rename (saltmean = salinity) %>% mutate (time =as.Date(time)) 
+SSC_ubc_salt_csv$latitude <- round(SSC_ubc_salt_csv$latitude, digits = 5) 
+SSC_ubc_salt_csv$longitude<- round(SSC_ubc_salt_csv$longitude, digits = 4) 
+
+SSC_ubc_temp_csv <- readr::read_csv("raw_data/DFO- SalishSeaCast//2007-2023 Current (V21-11)/Temperature_All_MonthlyMeanMinMax.csv") %>%  rename(deptht = depth, tempmean=temperature_mean, tempmax= temperature_max, tempmin = temperature_min) %>% filter(deptht < 30)
+SSC_ubc_temp_csv$deptht[SSC_ubc_temp_csv$deptht > 1] <- 9.5
+SSC_ubc_temp_csv$deptht[SSC_ubc_temp_csv$deptht < 1] <- 0.5
+SSC_ubc_temp_csv$latitude <- round(SSC_ubc_temp_csv$latitude, digits = 5) 
+SSC_ubc_temp_csv$longitude<- round(SSC_ubc_temp_csv$longitude, digits = 4) 
+
+# get x and y from dfo grid to be able to join ubc and dfo data
+dfo_mgrid <- SSC_dfo_month_grid %>%  rename(longitude = nav_lon, latitude = nav_lat)
+dfo_mgrid$latitude <- round(dfo_mgrid$latitude, digits = 5) 
+dfo_mgrid$longitude<- round(dfo_mgrid$longitude, digits = 4) 
+
+SSC_ubc_month_data <- SSC_ubc_salt_csv %>% 
+  left_join(dfo_mgrid, by = join_by(longitude, latitude)) %>% 
+  left_join(SSC_ubc_temp_csv, by = join_by(longitude, latitude, time, deptht)) %>% 
+  mutate(year = year(time), time_counter = NA) %>%
+  select(-c(time, latitude, longitude))%>%
+  mutate(across(c( x, y), as.numeric))
+
+
+#bind ubc and dfo data
+SSC_month_data <-bind_rows(SSC_ubc_month_data, SSC_dfo_month_data) 
+
+summary(SSC_month_data)
+
+```
+
+#Create Predictor Hindcast Climatology, for training (from 1993-2023)
+```{r}
+## Create climatologies of hindcast variables for prediction to occur onto for present day
+# Set the start and end year for the climatology to be calculated based off of
+start <- 1993
+end <- 2023
+
+
+#Summarise and make rasters
+#### ROMS data####
+
+#subset the talk data by these start and end year
+TAlk_sub <- BCCM_h_TAlk_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+TAlk_summary_year <- TAlk_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% 
+  dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE))
+#Summarise the TAlk data into the desired climatologies for the entire time period
+TAlk_summary <- TAlk_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(TAlk_10_mean = mean(mean_10_year, na.rm = TRUE))
+#Combine the above dataframe with the TAlk grid and filter out erroneous entries
+TAlk_summary_grid <- dplyr::full_join(TAlk_summary, BCCM_h_TAlk_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+TAlk_points <- sf::st_as_sf(TAlk_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_TAlk_10_mean_rast <- terra::rasterize(TAlk_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(TAlk_points), res=3000),field = "TAlk_10_mean", fun=mean)
+
+#subset the salt data by these start and end year
+salt_sub <- BCCM_h_salt_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+salt_summary_year <- salt_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the salt data into the desired climatologies for the entire time period
+salt_summary <- salt_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(salt_10_mean = mean(mean_10_year, na.rm = TRUE),  salt_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the salt grid and filter out erroneous entries
+salt_summary_grid <- dplyr::full_join(salt_summary, BCCM_h_salt_grid, by=c("xi_rho","eta_rho")) %>% na.omit()
+#Convert to spatial points and transform to grid crs
+salt_points <- sf::st_as_sf(salt_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_salt_10_mean_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_mean", fun=mean)
+bccm_salt_10_min_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_min", fun=mean)
+
+
+#subset the do data by these start and end year
+do_sub <- BCCM_h_do_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+do_summary_year <- do_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the do data into the desired climatologies for the entire time period
+do_summary <- do_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(do_10_mean = mean(mean_10_year, na.rm = TRUE), do_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the sshPAR grid and filter out erroneous entries
+do_summary_grid <- dplyr::full_join(do_summary, BCCM_h_do_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+do_points <- sf::st_as_sf(do_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_do_10_mean_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_mean", fun=mean)
+bccm_do_10_min_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_min", fun=mean)
+
+#subset the temp data by these start and end year
+temp_sub <- BCCM_h_temp_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+temp_summary_year <- temp_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_sur_year = mean(mean_sur, na.rm = TRUE), max_sur_year = max(mean_sur, na.rm = TRUE), min_sur_year = min(mean_sur, na.rm = TRUE), mean_10_year = mean(mean_10m, na.rm = TRUE), max_10_year = max(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the temp data into the desired climatologies for the entire time period
+temp_summary <- temp_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(temp_s_mean = mean(mean_sur_year, na.rm = TRUE), temp_s_max = mean(max_sur_year, na.rm = TRUE), temp_s_min = mean(min_sur_year, na.rm = TRUE), temp_10_mean = mean(mean_10_year, na.rm = TRUE), temp_10_max = mean(max_10_year, na.rm = TRUE), temp_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the temp grid and filter out erroneous entries
+temp_summary_grid <- dplyr::full_join(temp_summary, BCCM_h_temp_grid, by=c("xi_rho","eta_rho")) %>% na.omit() # %>% dplyr::filter(temp_s_min >= 0, temp_10_min >= 0)
+
+#Convert to spatial points and transform to grid crs
+temp_points <- sf::st_as_sf(temp_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_temp_s_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_mean", fun=mean)
+bccm_temp_s_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_max", fun=mean)
+bccm_temp_s_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_min", fun=mean)
+bccm_temp_10_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_mean", fun=mean)
+bccm_temp_10_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_max", fun=mean)
+bccm_temp_10_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_min", fun=mean)
+
+
+#### SalishSeaCast Yearly data for TAlk,  DO####
+
+#subset the year data by these start and end year, and just surface values
+Year_surf_sub <- SSC_year_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht < 2)
+
+#Summarise the predictor into the desired climatologies for the entire time period
+year_surf_summary <- Year_surf_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_sur = mean(TAlkmean, na.rm = TRUE),
+                   DO_mean_sur = mean(DOmean, na.rm = TRUE), DO_min_sur = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the  grid and filter out erroneous entries
+year_surf_summary_grid <- dplyr::full_join(year_surf_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_surf_points <- sf::st_as_sf(year_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of interest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "TAlk_mean_sur", fun=mean)
+ssc_DO_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_mean_sur", fun=mean)
+ssc_DO_sur_min_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_min_sur", fun=mean)
+
+
+#subset the year data by these start and end year, and just 10m values
+Year_10_sub <- SSC_year_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht > 2)
+#Summarise the predictor into the desired climatologies for the entire time period
+year_10_summary <- Year_10_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_10 = mean(TAlkmean, na.rm = TRUE), 
+                   DO_mean_10 = mean(DOmean, na.rm = TRUE), DO_min_10 = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+year_10_summary_grid <- dplyr::full_join(year_10_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_10_points <- sf::st_as_sf(year_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "TAlk_mean_10", fun=mean)%>%
+  terra::merge(ssc_TAlk_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_mean_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_min_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_min_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_min_rast, na.rm=TRUE)
+
+#### SalishSeaCast Monthly data for temperature and salinity####
+
+#subset the year data by these start and end year, and just surface values
+Month_surf_sub <- SSC_month_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht < 2)
+#Summarise the predictor by year
+month_surf_summary_year <- Month_surf_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_sur_year = mean(saltmean, na.rm = TRUE), salt_min_sur_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_sur_year = mean(tempmean, na.rm = TRUE), temp_max_sur_year = max(tempmean, na.rm = TRUE), temp_min_sur_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_surf_summary <- month_surf_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_sur = mean(salt_mean_sur_year, na.rm = TRUE), salt_min_sur = mean(salt_min_sur_year, na.rm = TRUE),
+                   temp_mean_sur = mean(temp_mean_sur_year, na.rm = TRUE), temp_max_sur = mean(temp_max_sur_year, na.rm = TRUE), temp_min_sur = mean(temp_min_sur_year, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+month_surf_summary_grid <- dplyr::full_join(month_surf_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_sur > 0)
+#Convert to spatial points and transform to grid crs
+month_surf_points <- sf::st_as_sf(month_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_mean_sur", fun=mean)
+ssc_temp_sur_max_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_max_sur", fun=mean)
+ssc_temp_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_min_sur", fun=mean)
+ssc_salt_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_mean_sur", fun=mean)
+ssc_salt_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_min_sur", fun=mean)
+
+#subset the year data by these start and end year, and just 5m values
+Month_10_sub <- SSC_month_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht > 2)
+
+#Summarise the predictor by year
+month_10_summary_year <- Month_10_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_10_year = mean(saltmean, na.rm = TRUE), salt_min_10_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_10_year = mean(tempmean, na.rm = TRUE), temp_max_10_year = max(tempmean, na.rm = TRUE), temp_min_10_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_10_summary <- month_10_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_10 = mean(salt_mean_10_year, na.rm = TRUE), salt_min_10 = mean(salt_min_10_year, na.rm = TRUE),
+                   temp_mean_10 = mean(temp_mean_10_year, na.rm = TRUE), temp_max_10 = mean(temp_max_10_year, na.rm = TRUE), temp_min_10 = mean(temp_min_10_year, na.rm = TRUE))
+
+#Combine the above dataframe with the NH4 grid and filter out erroneous entries
+month_10_summary_grid <- dplyr::full_join(month_10_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_10 > 0)
+#Convert to spatial points and transform to grid crs
+month_10_points <- sf::st_as_sf(month_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_mean_10", fun=mean) %>%
+  terra::merge(ssc_temp_sur_mean_rast, na.rm=TRUE)
+ssc_temp_10_max_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_max_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_max_rast, na.rm=TRUE)
+ssc_temp_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_min_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_min_rast, na.rm=TRUE)
+ssc_salt_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_mean_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_mean_rast, na.rm=TRUE)
+ssc_salt_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_min_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_min_rast, na.rm=TRUE)
+
+
+#Stack all of the layers together
+BCCM_layers <- c(bccm_TAlk_10_mean_rast, bccm_salt_10_mean_rast, bccm_salt_10_min_rast, bccm_temp_s_mean_rast, bccm_temp_s_max_rast, bccm_temp_s_min_rast, bccm_temp_10_mean_rast, bccm_temp_10_max_rast, 
+                 bccm_temp_10_min_rast, bccm_do_10_mean_rast, bccm_do_10_min_rast)
+
+#choose the reference raster for alignment (e.g., ssc_salt_10_mean_rast)
+reference_rast <- ssc_salt_10_mean_rast
+
+# Align ssc_TAlk_10_mean_rast first
+ssc_TAlk_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_min_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+
+SSC_layers <- c(ssc_TAlk_10_mean_rast, ssc_salt_10_mean_rast, ssc_salt_10_min_rast, ssc_temp_sur_mean_rast, ssc_temp_sur_max_rast, ssc_temp_sur_min_rast, ssc_temp_10_mean_rast, ssc_temp_10_max_rast, ssc_temp_10_min_rast, ssc_DO_10_mean_rast, ssc_DO_10_min_rast)
+
+# resample (and reproject) onto DFO bathy grid
+BCCM_Resampled <- terra::sapp(BCCM_layers, function(x){
+  terra::focal(x,w=3, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#applied larger w to ssc layers otherwise was having bccm layers selected over ssc in nearshore shallow areas
+#extrapolation didn't seem too unreasonable 
+SSC_Resampled <- terra::sapp(SSC_layers, function(x){
+  terra::focal(x,w=7, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#merge ssc and bccm layers, chooses ssc layer over bccm if present in same cells. Mask it by bathy layer
+TAlk_10_mean_rast <- terra::merge(SSC_Resampled[[1]], BCCM_Resampled[[1]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_mean_rast <- terra::merge(SSC_Resampled[[2]], BCCM_Resampled[[2]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_min_rast <- terra::merge(SSC_Resampled[[3]], BCCM_Resampled[[3]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_mean_rast <- terra::merge(SSC_Resampled[[4]], BCCM_Resampled[[4]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_max_rast <- terra::merge(SSC_Resampled[[5]], BCCM_Resampled[[5]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_min_rast <- terra::merge(SSC_Resampled[[6]], BCCM_Resampled[[6]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_mean_rast <- terra::merge(SSC_Resampled[[7]], BCCM_Resampled[[7]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_max_rast <- terra::merge(SSC_Resampled[[8]], BCCM_Resampled[[8]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100) 
+temp_10_min_rast <- terra::merge(SSC_Resampled[[9]], BCCM_Resampled[[9]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_mean_rast <- terra::merge(SSC_Resampled[[10]], BCCM_Resampled[[10]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_min_rast <- terra::merge(SSC_Resampled[[11]], BCCM_Resampled[[11]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+
+
+Predictor_Hindcast_Climatologies <- c(TAlk_10_mean_rast, salt_10_mean_rast, salt_10_min_rast, temp_s_mean_rast, temp_s_max_rast, temp_s_min_rast, temp_10_mean_rast, temp_10_max_rast, temp_10_min_rast, do_10_mean_rast, do_10_min_rast)
+
+#Combine BCCM climatologies with the static predictor layers created previously to create  full hindcast predictor layer stack
+Predictor_Hindcast_Climatologies <- Predictor_Hindcast_Climatologies
+add(Predictor_Hindcast_Climatologies) <- Current_100
+add(Predictor_Hindcast_Climatologies) <- REI_100
+add(Predictor_Hindcast_Climatologies) <- Rock_100
+add(Predictor_Hindcast_Climatologies) <- Slope_100
+add(Predictor_Hindcast_Climatologies) <- DEM_100
+
+names(Predictor_Hindcast_Climatologies) <- c("TAlk_10m_mean", "salt_10m_mean", "salt_10m_min",  "temp_s_mean", "temp_s_max", "temp_s_min", "temp_10m_mean", "temp_10m_max",  "temp_10m_min", "do_10m_mean", "do_10m_min", "Current", "REI", "Rock", "Slope", "Depth")
+
+
+#Save the hindcast predictor raster
+terra::writeRaster(Predictor_Hindcast_Climatologies, "processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_1993-2023.tif", overwrite = TRUE)
+
+```
+
+#Create Predictor Hindcast Climatology, for projections (from 2012-2023)
+```{r}
+## Create climatologies of hindcast variables for prediction to occur onto for present day
+# Set the start and end year for the climatology to be calculated based off of
+
+# 1993-2002, 2003-2012, 2013-2023. Also did 1993-2023 for prediction grid
+start <- 2017
+end <- 2023
+
+
+#Summarise and make rasters
+#### ROMS data####
+
+#subset the talk data by these start and end year
+TAlk_sub <- BCCM_h_TAlk_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+TAlk_summary_year <- TAlk_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% 
+  dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE))
+#Summarise the TAlk data into the desired climatologies for the entire time period
+TAlk_summary <- TAlk_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(TAlk_10_mean = mean(mean_10_year, na.rm = TRUE))
+#Combine the above dataframe with the TAlk grid and filter out erroneous entries
+TAlk_summary_grid <- dplyr::full_join(TAlk_summary, BCCM_h_TAlk_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+TAlk_points <- sf::st_as_sf(TAlk_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_TAlk_10_mean_rast <- terra::rasterize(TAlk_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(TAlk_points), res=3000),field = "TAlk_10_mean", fun=mean)
+
+#subset the salt data by these start and end year
+salt_sub <- BCCM_h_salt_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+salt_summary_year <- salt_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the salt data into the desired climatologies for the entire time period
+salt_summary <- salt_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(salt_10_mean = mean(mean_10_year, na.rm = TRUE),  salt_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the salt grid and filter out erroneous entries
+salt_summary_grid <- dplyr::full_join(salt_summary, BCCM_h_salt_grid, by=c("xi_rho","eta_rho")) %>% na.omit()
+#Convert to spatial points and transform to grid crs
+salt_points <- sf::st_as_sf(salt_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_salt_10_mean_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_mean", fun=mean)
+bccm_salt_10_min_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_min", fun=mean)
+
+
+#subset the do data by these start and end year
+do_sub <- BCCM_h_do_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+do_summary_year <- do_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the do data into the desired climatologies for the entire time period
+do_summary <- do_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(do_10_mean = mean(mean_10_year, na.rm = TRUE), do_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the sshPAR grid and filter out erroneous entries
+do_summary_grid <- dplyr::full_join(do_summary, BCCM_h_do_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+do_points <- sf::st_as_sf(do_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_do_10_mean_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_mean", fun=mean)
+bccm_do_10_min_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_min", fun=mean)
+
+#subset the temp data by these start and end year
+temp_sub <- BCCM_h_temp_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+temp_summary_year <- temp_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_sur_year = mean(mean_sur, na.rm = TRUE), max_sur_year = max(mean_sur, na.rm = TRUE), min_sur_year = min(mean_sur, na.rm = TRUE), mean_10_year = mean(mean_10m, na.rm = TRUE), max_10_year = max(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the temp data into the desired climatologies for the entire time period
+temp_summary <- temp_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(temp_s_mean = mean(mean_sur_year, na.rm = TRUE), temp_s_max = mean(max_sur_year, na.rm = TRUE), temp_s_min = mean(min_sur_year, na.rm = TRUE), temp_10_mean = mean(mean_10_year, na.rm = TRUE), temp_10_max = mean(max_10_year, na.rm = TRUE), temp_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the temp grid and filter out erroneous entries
+temp_summary_grid <- dplyr::full_join(temp_summary, BCCM_h_temp_grid, by=c("xi_rho","eta_rho")) %>% na.omit() # %>% dplyr::filter(temp_s_min >= 0, temp_10_min >= 0)
+
+#Convert to spatial points and transform to grid crs
+temp_points <- sf::st_as_sf(temp_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_temp_s_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_mean", fun=mean)
+bccm_temp_s_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_max", fun=mean)
+bccm_temp_s_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_min", fun=mean)
+bccm_temp_10_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_mean", fun=mean)
+bccm_temp_10_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_max", fun=mean)
+bccm_temp_10_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_min", fun=mean)
+
+
+#### SalishSeaCast Yearly data for TAlk,  DO####
+
+#subset the year data by these start and end year, and just surface values
+Year_surf_sub <- SSC_year_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht < 2)
+
+#Summarise the predictor into the desired climatologies for the entire time period
+year_surf_summary <- Year_surf_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_sur = mean(TAlkmean, na.rm = TRUE),
+                   DO_mean_sur = mean(DOmean, na.rm = TRUE), DO_min_sur = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the  grid and filter out erroneous entries
+year_surf_summary_grid <- dplyr::full_join(year_surf_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_surf_points <- sf::st_as_sf(year_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of interest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "TAlk_mean_sur", fun=mean)
+ssc_DO_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_mean_sur", fun=mean)
+ssc_DO_sur_min_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_min_sur", fun=mean)
+
+
+#subset the year data by these start and end year, and just 10m values
+Year_10_sub <- SSC_year_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht > 2)
+#Summarise the predictor into the desired climatologies for the entire time period
+year_10_summary <- Year_10_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_10 = mean(TAlkmean, na.rm = TRUE), 
+                   DO_mean_10 = mean(DOmean, na.rm = TRUE), DO_min_10 = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+year_10_summary_grid <- dplyr::full_join(year_10_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_10_points <- sf::st_as_sf(year_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "TAlk_mean_10", fun=mean)%>%
+  terra::merge(ssc_TAlk_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_mean_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_min_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_min_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_min_rast, na.rm=TRUE)
+
+#### SalishSeaCast Monthly data for temperature and salinity####
+
+#subset the year data by these start and end year, and just surface values
+Month_surf_sub <- SSC_month_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht < 2)
+#Summarise the predictor by year
+month_surf_summary_year <- Month_surf_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_sur_year = mean(saltmean, na.rm = TRUE), salt_min_sur_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_sur_year = mean(tempmean, na.rm = TRUE), temp_max_sur_year = max(tempmean, na.rm = TRUE), temp_min_sur_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_surf_summary <- month_surf_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_sur = mean(salt_mean_sur_year, na.rm = TRUE), salt_min_sur = mean(salt_min_sur_year, na.rm = TRUE),
+                   temp_mean_sur = mean(temp_mean_sur_year, na.rm = TRUE), temp_max_sur = mean(temp_max_sur_year, na.rm = TRUE), temp_min_sur = mean(temp_min_sur_year, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+month_surf_summary_grid <- dplyr::full_join(month_surf_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_sur > 0)
+#Convert to spatial points and transform to grid crs
+month_surf_points <- sf::st_as_sf(month_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_mean_sur", fun=mean)
+ssc_temp_sur_max_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_max_sur", fun=mean)
+ssc_temp_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_min_sur", fun=mean)
+ssc_salt_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_mean_sur", fun=mean)
+ssc_salt_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_min_sur", fun=mean)
+
+#subset the year data by these start and end year, and just 5m values
+Month_10_sub <- SSC_month_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht > 2)
+
+#Summarise the predictor by year
+month_10_summary_year <- Month_10_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_10_year = mean(saltmean, na.rm = TRUE), salt_min_10_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_10_year = mean(tempmean, na.rm = TRUE), temp_max_10_year = max(tempmean, na.rm = TRUE), temp_min_10_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_10_summary <- month_10_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_10 = mean(salt_mean_10_year, na.rm = TRUE), salt_min_10 = mean(salt_min_10_year, na.rm = TRUE),
+                   temp_mean_10 = mean(temp_mean_10_year, na.rm = TRUE), temp_max_10 = mean(temp_max_10_year, na.rm = TRUE), temp_min_10 = mean(temp_min_10_year, na.rm = TRUE))
+
+#Combine the above dataframe with the NH4 grid and filter out erroneous entries
+month_10_summary_grid <- dplyr::full_join(month_10_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_10 > 0)
+#Convert to spatial points and transform to grid crs
+month_10_points <- sf::st_as_sf(month_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_mean_10", fun=mean) %>%
+  terra::merge(ssc_temp_sur_mean_rast, na.rm=TRUE)
+ssc_temp_10_max_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_max_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_max_rast, na.rm=TRUE)
+ssc_temp_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_min_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_min_rast, na.rm=TRUE)
+ssc_salt_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_mean_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_mean_rast, na.rm=TRUE)
+ssc_salt_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_min_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_min_rast, na.rm=TRUE)
+
+
+#Stack all of the layers together
+BCCM_layers <- c(bccm_TAlk_10_mean_rast, bccm_salt_10_mean_rast, bccm_salt_10_min_rast, bccm_temp_s_mean_rast, bccm_temp_s_max_rast, bccm_temp_s_min_rast, bccm_temp_10_mean_rast, bccm_temp_10_max_rast, 
+                 bccm_temp_10_min_rast, bccm_do_10_mean_rast, bccm_do_10_min_rast)
+
+#choose the reference raster for alignment (e.g., ssc_salt_10_mean_rast)
+reference_rast <- ssc_salt_10_mean_rast
+
+# Align ssc_TAlk_10_mean_rast first
+ssc_TAlk_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_min_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+
+SSC_layers <- c(ssc_TAlk_10_mean_rast, ssc_salt_10_mean_rast, ssc_salt_10_min_rast, ssc_temp_sur_mean_rast, ssc_temp_sur_max_rast, ssc_temp_sur_min_rast, ssc_temp_10_mean_rast, ssc_temp_10_max_rast, ssc_temp_10_min_rast, ssc_DO_10_mean_rast, ssc_DO_10_min_rast)
+
+# resample (and reproject) onto DFO bathy grid
+BCCM_Resampled <- terra::sapp(BCCM_layers, function(x){
+  terra::focal(x,w=3, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#applied larger w to ssc layers otherwise was having bccm layers selected over ssc in nearshore shallow areas
+#extrapolation didn't seem too unreasonable 
+SSC_Resampled <- terra::sapp(SSC_layers, function(x){
+  terra::focal(x,w=7, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#merge ssc and bccm layers, chooses ssc layer over bccm if present in same cells. Mask it by bathy layer
+TAlk_10_mean_rast <- terra::merge(SSC_Resampled[[1]], BCCM_Resampled[[1]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_mean_rast <- terra::merge(SSC_Resampled[[2]], BCCM_Resampled[[2]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_min_rast <- terra::merge(SSC_Resampled[[3]], BCCM_Resampled[[3]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_mean_rast <- terra::merge(SSC_Resampled[[4]], BCCM_Resampled[[4]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_max_rast <- terra::merge(SSC_Resampled[[5]], BCCM_Resampled[[5]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_min_rast <- terra::merge(SSC_Resampled[[6]], BCCM_Resampled[[6]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_mean_rast <- terra::merge(SSC_Resampled[[7]], BCCM_Resampled[[7]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_max_rast <- terra::merge(SSC_Resampled[[8]], BCCM_Resampled[[8]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100) 
+temp_10_min_rast <- terra::merge(SSC_Resampled[[9]], BCCM_Resampled[[9]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_mean_rast <- terra::merge(SSC_Resampled[[10]], BCCM_Resampled[[10]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_min_rast <- terra::merge(SSC_Resampled[[11]], BCCM_Resampled[[11]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+
+
+Predictor_Hindcast_Climatologies <- c(TAlk_10_mean_rast, salt_10_mean_rast, salt_10_min_rast, temp_s_mean_rast, temp_s_max_rast, temp_s_min_rast, temp_10_mean_rast, temp_10_max_rast, temp_10_min_rast, do_10_mean_rast, do_10_min_rast)
+
+#Combine BCCM climatologies with the static predictor layers created previously to create  full hindcast predictor layer stack
+Predictor_Hindcast_Climatologies <- Predictor_Hindcast_Climatologies
+add(Predictor_Hindcast_Climatologies) <- Current_100
+add(Predictor_Hindcast_Climatologies) <- REI_100
+add(Predictor_Hindcast_Climatologies) <- Rock_100
+add(Predictor_Hindcast_Climatologies) <- Slope_100
+add(Predictor_Hindcast_Climatologies) <- DEM_100
+
+names(Predictor_Hindcast_Climatologies) <- c("TAlk_10m_mean", "salt_10m_mean", "salt_10m_min",  "temp_s_mean", "temp_s_max", "temp_s_min", "temp_10m_mean", "temp_10m_max",  "temp_10m_min", "do_10m_mean", "do_10m_min", "Current", "REI", "Rock", "Slope", "Depth")
+
+
+#Save the hindcast predictor raster
+terra::writeRaster(Predictor_Hindcast_Climatologies, "processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2017-2023.tif", overwrite = TRUE)
+```
+
+#Create hindcast predictor for a single year 
+```{r}
+#loop through every year
+
+#Set up a list of all the years for the hindcast
+years <- seq(from = 2007, to = 2021, by = 1) #so Salish Sea cast layers for 2006?, run from 1993-2005 then 2006 to 2021
+
+for (i in years){#subset the talk data by the year
+  #subset the talk data by these start and end year
+print(i)
+TAlk_sub <- BCCM_h_TAlk_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+TAlk_summary_year <- TAlk_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% 
+  dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE))
+#Summarise the TAlk data into the desired climatologies for the entire time period
+TAlk_summary <- TAlk_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(TAlk_10_mean = mean(mean_10_year, na.rm = TRUE))
+#Combine the above dataframe with the TAlk grid and filter out erroneous entries
+TAlk_summary_grid <- dplyr::full_join(TAlk_summary, BCCM_h_TAlk_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+TAlk_points <- sf::st_as_sf(TAlk_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_TAlk_10_mean_rast <- terra::rasterize(TAlk_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(TAlk_points), res=3000),field = "TAlk_10_mean", fun=mean)
+
+#subset the salt data by these start and end year
+salt_sub <- BCCM_h_salt_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+salt_summary_year <- salt_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the salt data into the desired climatologies for the entire time period
+salt_summary <- salt_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(salt_10_mean = mean(mean_10_year, na.rm = TRUE),  salt_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the salt grid and filter out erroneous entries
+salt_summary_grid <- dplyr::full_join(salt_summary, BCCM_h_salt_grid, by=c("xi_rho","eta_rho")) %>% na.omit()
+#Convert to spatial points and transform to grid crs
+salt_points <- sf::st_as_sf(salt_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_salt_10_mean_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_mean", fun=mean)
+bccm_salt_10_min_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_min", fun=mean)
+
+
+#subset the do data by these start and end year
+do_sub <- BCCM_h_do_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+do_summary_year <- do_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the do data into the desired climatologies for the entire time period
+do_summary <- do_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(do_10_mean = mean(mean_10_year, na.rm = TRUE), do_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the sshPAR grid and filter out erroneous entries
+do_summary_grid <- dplyr::full_join(do_summary, BCCM_h_do_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+do_points <- sf::st_as_sf(do_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_do_10_mean_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_mean", fun=mean)
+bccm_do_10_min_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_min", fun=mean)
+
+#subset the temp data by these start and end year
+temp_sub <- BCCM_h_temp_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+temp_summary_year <- temp_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_sur_year = mean(mean_sur, na.rm = TRUE), max_sur_year = max(mean_sur, na.rm = TRUE), min_sur_year = min(mean_sur, na.rm = TRUE), mean_10_year = mean(mean_10m, na.rm = TRUE), max_10_year = max(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the temp data into the desired climatologies for the entire time period
+temp_summary <- temp_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(temp_s_mean = mean(mean_sur_year, na.rm = TRUE), temp_s_max = mean(max_sur_year, na.rm = TRUE), temp_s_min = mean(min_sur_year, na.rm = TRUE), temp_10_mean = mean(mean_10_year, na.rm = TRUE), temp_10_max = mean(max_10_year, na.rm = TRUE), temp_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the temp grid and filter out erroneous entries
+temp_summary_grid <- dplyr::full_join(temp_summary, BCCM_h_temp_grid, by=c("xi_rho","eta_rho")) %>% na.omit() # %>% dplyr::filter(temp_s_min >= 0, temp_10_min >= 0)
+
+#Convert to spatial points and transform to grid crs
+temp_points <- sf::st_as_sf(temp_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_temp_s_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_mean", fun=mean)
+bccm_temp_s_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_max", fun=mean)
+bccm_temp_s_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_min", fun=mean)
+bccm_temp_10_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_mean", fun=mean)
+bccm_temp_10_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_max", fun=mean)
+bccm_temp_10_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_min", fun=mean)
+
+
+#### SalishSeaCast Yearly data for TAlk,  DO####
+
+#subset the year data by these start and end year, and just surface values
+Year_surf_sub <- SSC_year_data %>% 
+  dplyr::filter(year == i,
+                deptht < 2)
+
+#Summarise the predictor into the desired climatologies for the entire time period
+year_surf_summary <- Year_surf_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_sur = mean(TAlkmean, na.rm = TRUE),
+                   DO_mean_sur = mean(DOmean, na.rm = TRUE), DO_min_sur = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the  grid and filter out erroneous entries
+year_surf_summary_grid <- dplyr::full_join(year_surf_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_surf_points <- sf::st_as_sf(year_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of interest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "TAlk_mean_sur", fun=mean)
+ssc_DO_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_mean_sur", fun=mean)
+ssc_DO_sur_min_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_min_sur", fun=mean)
+
+
+#subset the year data by these start and end year, and just 10m values
+Year_10_sub <- SSC_year_data %>% 
+  dplyr::filter(year == i,
+                deptht > 2)
+#Summarise the predictor into the desired climatologies for the entire time period
+year_10_summary <- Year_10_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_10 = mean(TAlkmean, na.rm = TRUE), 
+                   DO_mean_10 = mean(DOmean, na.rm = TRUE), DO_min_10 = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+year_10_summary_grid <- dplyr::full_join(year_10_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_10_points <- sf::st_as_sf(year_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "TAlk_mean_10", fun=mean)%>%
+  terra::merge(ssc_TAlk_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_mean_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_min_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_min_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_min_rast, na.rm=TRUE)
+
+#### SalishSeaCast Monthly data for temperature and salinity####
+
+#subset the year data by these start and end year, and just surface values
+Month_surf_sub <- SSC_month_data %>% 
+  dplyr::filter(year == i,
+                deptht < 2)
+#Summarise the predictor by year
+month_surf_summary_year <- Month_surf_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_sur_year = mean(saltmean, na.rm = TRUE), salt_min_sur_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_sur_year = mean(tempmean, na.rm = TRUE), temp_max_sur_year = max(tempmean, na.rm = TRUE), temp_min_sur_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_surf_summary <- month_surf_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_sur = mean(salt_mean_sur_year, na.rm = TRUE), salt_min_sur = mean(salt_min_sur_year, na.rm = TRUE),
+                   temp_mean_sur = mean(temp_mean_sur_year, na.rm = TRUE), temp_max_sur = mean(temp_max_sur_year, na.rm = TRUE), temp_min_sur = mean(temp_min_sur_year, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+month_surf_summary_grid <- dplyr::full_join(month_surf_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_sur > 0)
+#Convert to spatial points and transform to grid crs
+month_surf_points <- sf::st_as_sf(month_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_mean_sur", fun=mean)
+ssc_temp_sur_max_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_max_sur", fun=mean)
+ssc_temp_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_min_sur", fun=mean)
+ssc_salt_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_mean_sur", fun=mean)
+ssc_salt_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_min_sur", fun=mean)
+
+#subset the year data by these start and end year, and just 5m values
+Month_10_sub <- SSC_month_data %>% 
+  dplyr::filter(year == i,
+                deptht > 2)
+
+#Summarise the predictor by year
+month_10_summary_year <- Month_10_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_10_year = mean(saltmean, na.rm = TRUE), salt_min_10_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_10_year = mean(tempmean, na.rm = TRUE), temp_max_10_year = max(tempmean, na.rm = TRUE), temp_min_10_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_10_summary <- month_10_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_10 = mean(salt_mean_10_year, na.rm = TRUE), salt_min_10 = mean(salt_min_10_year, na.rm = TRUE),
+                   temp_mean_10 = mean(temp_mean_10_year, na.rm = TRUE), temp_max_10 = mean(temp_max_10_year, na.rm = TRUE), temp_min_10 = mean(temp_min_10_year, na.rm = TRUE))
+
+#Combine the above dataframe with the NH4 grid and filter out erroneous entries
+month_10_summary_grid <- dplyr::full_join(month_10_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_10 > 0)
+#Convert to spatial points and transform to grid crs
+month_10_points <- sf::st_as_sf(month_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_mean_10", fun=mean) %>%
+  terra::merge(ssc_temp_sur_mean_rast, na.rm=TRUE)
+ssc_temp_10_max_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_max_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_max_rast, na.rm=TRUE)
+ssc_temp_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_min_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_min_rast, na.rm=TRUE)
+ssc_salt_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_mean_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_mean_rast, na.rm=TRUE)
+ssc_salt_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_min_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_min_rast, na.rm=TRUE)
+
+
+#Stack all of the layers together
+BCCM_layers <- c(bccm_TAlk_10_mean_rast, bccm_salt_10_mean_rast, bccm_salt_10_min_rast, bccm_temp_s_mean_rast, bccm_temp_s_max_rast, bccm_temp_s_min_rast, bccm_temp_10_mean_rast, bccm_temp_10_max_rast, 
+                 bccm_temp_10_min_rast, bccm_do_10_mean_rast, bccm_do_10_min_rast)
+
+#choose the reference raster for alignment (e.g., ssc_salt_10_mean_rast)
+reference_rast <- ssc_salt_10_mean_rast
+
+# Align ssc_TAlk_10_mean_rast first
+ssc_TAlk_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_min_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+
+SSC_layers <- c(ssc_TAlk_10_mean_rast, ssc_salt_10_mean_rast, ssc_salt_10_min_rast, ssc_temp_sur_mean_rast, ssc_temp_sur_max_rast, ssc_temp_sur_min_rast, ssc_temp_10_mean_rast, ssc_temp_10_max_rast, ssc_temp_10_min_rast, ssc_DO_10_mean_rast, ssc_DO_10_min_rast)
+
+# resample (and reproject) onto DFO bathy grid
+BCCM_Resampled <- terra::sapp(BCCM_layers, function(x){
+  terra::focal(x,w=3, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#applied larger w to ssc layers otherwise was having bccm layers selected over ssc in nearshore shallow areas
+#extrapolation didn't seem too unreasonable 
+SSC_Resampled <- terra::sapp(SSC_layers, function(x){
+  terra::focal(x,w=7, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#merge ssc and bccm layers, chooses ssc layer over bccm if present in same cells. Mask it by bathy layer
+TAlk_10_mean_rast <- terra::merge(SSC_Resampled[[1]], BCCM_Resampled[[1]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_mean_rast <- terra::merge(SSC_Resampled[[2]], BCCM_Resampled[[2]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_min_rast <- terra::merge(SSC_Resampled[[3]], BCCM_Resampled[[3]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_mean_rast <- terra::merge(SSC_Resampled[[4]], BCCM_Resampled[[4]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_max_rast <- terra::merge(SSC_Resampled[[5]], BCCM_Resampled[[5]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_min_rast <- terra::merge(SSC_Resampled[[6]], BCCM_Resampled[[6]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_mean_rast <- terra::merge(SSC_Resampled[[7]], BCCM_Resampled[[7]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_max_rast <- terra::merge(SSC_Resampled[[8]], BCCM_Resampled[[8]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100) 
+temp_10_min_rast <- terra::merge(SSC_Resampled[[9]], BCCM_Resampled[[9]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_mean_rast <- terra::merge(SSC_Resampled[[10]], BCCM_Resampled[[10]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_min_rast <- terra::merge(SSC_Resampled[[11]], BCCM_Resampled[[11]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+
+
+Predictor_Hindcast_Climatologies <- c(TAlk_10_mean_rast, salt_10_mean_rast, salt_10_min_rast, temp_s_mean_rast, temp_s_max_rast, temp_s_min_rast, temp_10_mean_rast, temp_10_max_rast, temp_10_min_rast, do_10_mean_rast, do_10_min_rast)
+
+#Combine BCCM climatologies with the static predictor layers created previously to create  full hindcast predictor layer stack
+Predictor_Hindcast_Climatologies <- Predictor_Hindcast_Climatologies
+add(Predictor_Hindcast_Climatologies) <- Current_100
+add(Predictor_Hindcast_Climatologies) <- REI_100
+add(Predictor_Hindcast_Climatologies) <- Rock_100
+add(Predictor_Hindcast_Climatologies) <- Slope_100
+add(Predictor_Hindcast_Climatologies) <- DEM_100
+
+names(Predictor_Hindcast_Climatologies) <- c("TAlk_10m_mean", "salt_10m_mean", "salt_10m_min",  "temp_s_mean", "temp_s_max", "temp_s_min", "temp_10m_mean", "temp_10m_max",  "temp_10m_min", "do_10m_mean", "do_10m_min", "Current", "REI", "Rock", "Slope", "Depth")
+
+  #Save the hindcast predictor raster
+  terra::writeRaster(Predictor_Hindcast_Climatologies, paste0("processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", paste(i),".tif"), overwrite = TRUE)
+  
+  gc()
+}
+
+
+
+```
+
+
+#Debugging single years
+```{r}
+i <- 2006
+
+TAlk_sub <- BCCM_h_TAlk_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+TAlk_summary_year <- TAlk_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% 
+  dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE))
+#Summarise the TAlk data into the desired climatologies for the entire time period
+TAlk_summary <- TAlk_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(TAlk_10_mean = mean(mean_10_year, na.rm = TRUE))
+#Combine the above dataframe with the TAlk grid and filter out erroneous entries
+TAlk_summary_grid <- dplyr::full_join(TAlk_summary, BCCM_h_TAlk_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+TAlk_points <- sf::st_as_sf(TAlk_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_TAlk_10_mean_rast <- terra::rasterize(TAlk_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(TAlk_points), res=3000),field = "TAlk_10_mean", fun=mean)
+
+#subset the salt data by these start and end year
+salt_sub <- BCCM_h_salt_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+salt_summary_year <- salt_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the salt data into the desired climatologies for the entire time period
+salt_summary <- salt_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(salt_10_mean = mean(mean_10_year, na.rm = TRUE),  salt_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the salt grid and filter out erroneous entries
+salt_summary_grid <- dplyr::full_join(salt_summary, BCCM_h_salt_grid, by=c("xi_rho","eta_rho")) %>% na.omit()
+#Convert to spatial points and transform to grid crs
+salt_points <- sf::st_as_sf(salt_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_salt_10_mean_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_mean", fun=mean)
+bccm_salt_10_min_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_min", fun=mean)
+
+
+#subset the do data by these start and end year
+do_sub <- BCCM_h_do_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+do_summary_year <- do_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the do data into the desired climatologies for the entire time period
+do_summary <- do_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(do_10_mean = mean(mean_10_year, na.rm = TRUE), do_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the sshPAR grid and filter out erroneous entries
+do_summary_grid <- dplyr::full_join(do_summary, BCCM_h_do_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+do_points <- sf::st_as_sf(do_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_do_10_mean_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_mean", fun=mean)
+bccm_do_10_min_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_min", fun=mean)
+
+#subset the temp data by these start and end year
+temp_sub <- BCCM_h_temp_data %>% dplyr::filter(year == i)
+#Summarise the predictor by year
+temp_summary_year <- temp_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_sur_year = mean(mean_sur, na.rm = TRUE), max_sur_year = max(mean_sur, na.rm = TRUE), min_sur_year = min(mean_sur, na.rm = TRUE), mean_10_year = mean(mean_10m, na.rm = TRUE), max_10_year = max(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the temp data into the desired climatologies for the entire time period
+temp_summary <- temp_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(temp_s_mean = mean(mean_sur_year, na.rm = TRUE), temp_s_max = mean(max_sur_year, na.rm = TRUE), temp_s_min = mean(min_sur_year, na.rm = TRUE), temp_10_mean = mean(mean_10_year, na.rm = TRUE), temp_10_max = mean(max_10_year, na.rm = TRUE), temp_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the temp grid and filter out erroneous entries
+temp_summary_grid <- dplyr::full_join(temp_summary, BCCM_h_temp_grid, by=c("xi_rho","eta_rho")) %>% na.omit() # %>% dplyr::filter(temp_s_min >= 0, temp_10_min >= 0)
+
+#Convert to spatial points and transform to grid crs
+temp_points <- sf::st_as_sf(temp_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_temp_s_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_mean", fun=mean)
+bccm_temp_s_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_max", fun=mean)
+bccm_temp_s_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_min", fun=mean)
+bccm_temp_10_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_mean", fun=mean)
+bccm_temp_10_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_max", fun=mean)
+bccm_temp_10_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_min", fun=mean)
+
+
+#### SalishSeaCast Yearly data for TAlk,  DO####
+
+#subset the year data by these start and end year, and just surface values
+Year_surf_sub <- SSC_year_data %>% 
+  dplyr::filter(year == i,
+                deptht < 2)
+
+#Summarise the predictor into the desired climatologies for the entire time period
+year_surf_summary <- Year_surf_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_sur = mean(TAlkmean, na.rm = TRUE),
+                   DO_mean_sur = mean(DOmean, na.rm = TRUE), DO_min_sur = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the  grid and filter out erroneous entries
+year_surf_summary_grid <- dplyr::full_join(year_surf_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_surf_points <- sf::st_as_sf(year_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of interest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "TAlk_mean_sur", fun=mean)
+ssc_DO_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_mean_sur", fun=mean)
+ssc_DO_sur_min_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_min_sur", fun=mean)
+
+
+#subset the year data by these start and end year, and just 10m values
+Year_10_sub <- SSC_year_data %>% 
+  dplyr::filter(year == i,
+                deptht > 2)
+#Summarise the predictor into the desired climatologies for the entire time period
+year_10_summary <- Year_10_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_10 = mean(TAlkmean, na.rm = TRUE), 
+                   DO_mean_10 = mean(DOmean, na.rm = TRUE), DO_min_10 = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+year_10_summary_grid <- dplyr::full_join(year_10_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_10_points <- sf::st_as_sf(year_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "TAlk_mean_10", fun=mean)%>%
+  terra::merge(ssc_TAlk_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_mean_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_min_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_min_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_min_rast, na.rm=TRUE)
+
+#### SalishSeaCast Monthly data for temperature and salinity####
+
+#subset the year data by these start and end year, and just surface values
+Month_surf_sub <- SSC_month_data %>% 
+  dplyr::filter(year == i,
+                deptht < 2)
+#Summarise the predictor by year
+month_surf_summary_year <- Month_surf_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_sur_year = mean(saltmean, na.rm = TRUE), salt_min_sur_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_sur_year = mean(tempmean, na.rm = TRUE), temp_max_sur_year = max(tempmean, na.rm = TRUE), temp_min_sur_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_surf_summary <- month_surf_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_sur = mean(salt_mean_sur_year, na.rm = TRUE), salt_min_sur = mean(salt_min_sur_year, na.rm = TRUE),
+                   temp_mean_sur = mean(temp_mean_sur_year, na.rm = TRUE), temp_max_sur = mean(temp_max_sur_year, na.rm = TRUE), temp_min_sur = mean(temp_min_sur_year, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+month_surf_summary_grid <- dplyr::full_join(month_surf_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_sur > 0)
+#Convert to spatial points and transform to grid crs
+month_surf_points <- sf::st_as_sf(month_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_mean_sur", fun=mean)
+ssc_temp_sur_max_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_max_sur", fun=mean)
+ssc_temp_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_min_sur", fun=mean)
+ssc_salt_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_mean_sur", fun=mean)
+ssc_salt_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_min_sur", fun=mean)
+
+#subset the year data by these start and end year, and just 5m values
+Month_10_sub <- SSC_month_data %>% 
+  dplyr::filter(year == i,
+                deptht > 2)
+
+#Summarise the predictor by year
+month_10_summary_year <- Month_10_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_10_year = mean(saltmean, na.rm = TRUE), salt_min_10_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_10_year = mean(tempmean, na.rm = TRUE), temp_max_10_year = max(tempmean, na.rm = TRUE), temp_min_10_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_10_summary <- month_10_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_10 = mean(salt_mean_10_year, na.rm = TRUE), salt_min_10 = mean(salt_min_10_year, na.rm = TRUE),
+                   temp_mean_10 = mean(temp_mean_10_year, na.rm = TRUE), temp_max_10 = mean(temp_max_10_year, na.rm = TRUE), temp_min_10 = mean(temp_min_10_year, na.rm = TRUE))
+
+#Combine the above dataframe with the NH4 grid and filter out erroneous entries
+month_10_summary_grid <- dplyr::full_join(month_10_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_10 > 0)
+#Convert to spatial points and transform to grid crs
+month_10_points <- sf::st_as_sf(month_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_mean_10", fun=mean) %>%
+  terra::merge(ssc_temp_sur_mean_rast, na.rm=TRUE)
+ssc_temp_10_max_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_max_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_max_rast, na.rm=TRUE)
+ssc_temp_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_min_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_min_rast, na.rm=TRUE)
+ssc_salt_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_mean_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_mean_rast, na.rm=TRUE)
+ssc_salt_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_min_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_min_rast, na.rm=TRUE)
+
+
+#Stack all of the layers together
+BCCM_layers <- c(bccm_TAlk_10_mean_rast, bccm_salt_10_mean_rast, bccm_salt_10_min_rast, bccm_temp_s_mean_rast, bccm_temp_s_max_rast, bccm_temp_s_min_rast, bccm_temp_10_mean_rast, bccm_temp_10_max_rast, 
+                 bccm_temp_10_min_rast, bccm_do_10_mean_rast, bccm_do_10_min_rast)
+
+#choose the reference raster for alignment (e.g., ssc_salt_10_mean_rast)
+reference_rast <- ssc_salt_10_mean_rast
+
+# Align ssc_TAlk_10_mean_rast first
+ssc_TAlk_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_min_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+
+SSC_layers <- c(ssc_TAlk_10_mean_rast, ssc_salt_10_mean_rast, ssc_salt_10_min_rast, ssc_temp_sur_mean_rast, ssc_temp_sur_max_rast, ssc_temp_sur_min_rast, ssc_temp_10_mean_rast, ssc_temp_10_max_rast, ssc_temp_10_min_rast, ssc_DO_10_mean_rast, ssc_DO_10_min_rast)
+
+# resample (and reproject) onto DFO bathy grid
+BCCM_Resampled <- terra::sapp(BCCM_layers, function(x){
+  terra::focal(x,w=3, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#applied larger w to ssc layers otherwise was having bccm layers selected over ssc in nearshore shallow areas
+#extrapolation didn't seem too unreasonable 
+SSC_Resampled <- terra::sapp(SSC_layers, function(x){
+  terra::focal(x,w=7, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#merge ssc and bccm layers, chooses ssc layer over bccm if present in same cells. Mask it by bathy layer
+TAlk_10_mean_rast <- terra::merge(SSC_Resampled[[1]], BCCM_Resampled[[1]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_mean_rast <- terra::merge(SSC_Resampled[[2]], BCCM_Resampled[[2]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_min_rast <- terra::merge(SSC_Resampled[[3]], BCCM_Resampled[[3]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_mean_rast <- terra::merge(SSC_Resampled[[4]], BCCM_Resampled[[4]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_max_rast <- terra::merge(SSC_Resampled[[5]], BCCM_Resampled[[5]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_min_rast <- terra::merge(SSC_Resampled[[6]], BCCM_Resampled[[6]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_mean_rast <- terra::merge(SSC_Resampled[[7]], BCCM_Resampled[[7]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_max_rast <- terra::merge(SSC_Resampled[[8]], BCCM_Resampled[[8]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100) 
+temp_10_min_rast <- terra::merge(SSC_Resampled[[9]], BCCM_Resampled[[9]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_mean_rast <- terra::merge(SSC_Resampled[[10]], BCCM_Resampled[[10]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_min_rast <- terra::merge(SSC_Resampled[[11]], BCCM_Resampled[[11]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+
+
+Predictor_Hindcast_Climatologies <- c(TAlk_10_mean_rast, salt_10_mean_rast, salt_10_min_rast, temp_s_mean_rast, temp_s_max_rast, temp_s_min_rast, temp_10_mean_rast, temp_10_max_rast, temp_10_min_rast, do_10_mean_rast, do_10_min_rast)
+
+#Combine BCCM climatologies with the static predictor layers created previously to create  full hindcast predictor layer stack
+Predictor_Hindcast_Climatologies <- Predictor_Hindcast_Climatologies
+add(Predictor_Hindcast_Climatologies) <- Current_100
+add(Predictor_Hindcast_Climatologies) <- REI_100
+add(Predictor_Hindcast_Climatologies) <- Rock_100
+add(Predictor_Hindcast_Climatologies) <- Slope_100
+add(Predictor_Hindcast_Climatologies) <- DEM_100
+
+names(Predictor_Hindcast_Climatologies) <- c("TAlk_10m_mean", "salt_10m_mean", "salt_10m_min",  "temp_s_mean", "temp_s_max", "temp_s_min", "temp_10m_mean", "temp_10m_max",  "temp_10m_min", "do_10m_mean", "do_10m_min", "Current", "REI", "Rock", "Slope", "Depth")
+
+  #Save the hindcast predictor raster
+  terra::writeRaster(Predictor_Hindcast_Climatologies, paste0("processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", paste(i),".tif"), overwrite = TRUE)
+  
+  gc()
+```
+
+#Create 2006 predictor hindcast,  for training (from 2005-2007)
+```{r}
+## Create climatologies of hindcast variables for prediction to occur onto for present day
+# Set the start and end year for the climatology to be calculated based off of
+
+start <- 2005
+end <- 2007
+
+
+#Summarise and make rasters
+#### ROMS data####
+
+#subset the talk data by these start and end year
+TAlk_sub <- BCCM_h_TAlk_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+TAlk_summary_year <- TAlk_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% 
+  dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE))
+#Summarise the TAlk data into the desired climatologies for the entire time period
+TAlk_summary <- TAlk_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(TAlk_10_mean = mean(mean_10_year, na.rm = TRUE))
+#Combine the above dataframe with the TAlk grid and filter out erroneous entries
+TAlk_summary_grid <- dplyr::full_join(TAlk_summary, BCCM_h_TAlk_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+TAlk_points <- sf::st_as_sf(TAlk_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_TAlk_10_mean_rast <- terra::rasterize(TAlk_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(TAlk_points), res=3000),field = "TAlk_10_mean", fun=mean)
+
+#subset the salt data by these start and end year
+salt_sub <- BCCM_h_salt_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+salt_summary_year <- salt_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the salt data into the desired climatologies for the entire time period
+salt_summary <- salt_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(salt_10_mean = mean(mean_10_year, na.rm = TRUE),  salt_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the salt grid and filter out erroneous entries
+salt_summary_grid <- dplyr::full_join(salt_summary, BCCM_h_salt_grid, by=c("xi_rho","eta_rho")) %>% na.omit()
+#Convert to spatial points and transform to grid crs
+salt_points <- sf::st_as_sf(salt_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_salt_10_mean_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_mean", fun=mean)
+bccm_salt_10_min_rast <- terra::rasterize(salt_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(salt_points), res=3000),field = "salt_10_min", fun=mean)
+
+
+#subset the do data by these start and end year
+do_sub <- BCCM_h_do_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+do_summary_year <- do_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_10_year = mean(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the do data into the desired climatologies for the entire time period
+do_summary <- do_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(do_10_mean = mean(mean_10_year, na.rm = TRUE), do_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the sshPAR grid and filter out erroneous entries
+do_summary_grid <- dplyr::full_join(do_summary, BCCM_h_do_grid, by=c("xi_rho","eta_rho")) %>% na.omit() 
+#Convert to spatial points and transform to grid crs
+do_points <- sf::st_as_sf(do_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_do_10_mean_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_mean", fun=mean)
+bccm_do_10_min_rast <- terra::rasterize(do_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(do_points), res=3000),field = "do_10_min", fun=mean)
+
+#subset the temp data by these start and end year
+temp_sub <- BCCM_h_temp_data %>% dplyr::filter(year >= start & year <= end)
+#Summarise the predictor by year
+temp_summary_year <- temp_sub %>% dplyr::group_by(xi_rho, eta_rho, year) %>% dplyr::summarise(mean_sur_year = mean(mean_sur, na.rm = TRUE), max_sur_year = max(mean_sur, na.rm = TRUE), min_sur_year = min(mean_sur, na.rm = TRUE), mean_10_year = mean(mean_10m, na.rm = TRUE), max_10_year = max(mean_10m, na.rm = TRUE), min_10_year = min(mean_10m, na.rm = TRUE))
+#Summarise the temp data into the desired climatologies for the entire time period
+temp_summary <- temp_summary_year %>% dplyr::group_by(xi_rho, eta_rho) %>% dplyr::summarise(temp_s_mean = mean(mean_sur_year, na.rm = TRUE), temp_s_max = mean(max_sur_year, na.rm = TRUE), temp_s_min = mean(min_sur_year, na.rm = TRUE), temp_10_mean = mean(mean_10_year, na.rm = TRUE), temp_10_max = mean(max_10_year, na.rm = TRUE), temp_10_min = mean(min_10_year, na.rm = TRUE))
+#Combine the above dataframe with the temp grid and filter out erroneous entries
+temp_summary_grid <- dplyr::full_join(temp_summary, BCCM_h_temp_grid, by=c("xi_rho","eta_rho")) %>% na.omit() # %>% dplyr::filter(temp_s_min >= 0, temp_10_min >= 0)
+
+#Convert to spatial points and transform to grid crs
+temp_points <- sf::st_as_sf(temp_summary_grid, coords=(c("lon_rho", "lat_rho")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of interest onto the 3km equal area grid (size of BCCM pixels) with mean = akin to project
+bccm_temp_s_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_mean", fun=mean)
+bccm_temp_s_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_max", fun=mean)
+bccm_temp_s_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_s_min", fun=mean)
+bccm_temp_10_mean_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_mean", fun=mean)
+bccm_temp_10_max_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_max", fun=mean)
+bccm_temp_10_min_rast <- terra::rasterize(temp_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(temp_points), res=3000),field = "temp_10_min", fun=mean)
+
+
+#### SalishSeaCast Yearly data for TAlk,  DO####
+
+#subset the year data by these start and end year, and just surface values
+Year_surf_sub <- SSC_year_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht < 2)
+
+#Summarise the predictor into the desired climatologies for the entire time period
+year_surf_summary <- Year_surf_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_sur = mean(TAlkmean, na.rm = TRUE),
+                   DO_mean_sur = mean(DOmean, na.rm = TRUE), DO_min_sur = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the  grid and filter out erroneous entries
+year_surf_summary_grid <- dplyr::full_join(year_surf_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_surf_points <- sf::st_as_sf(year_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of interest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "TAlk_mean_sur", fun=mean)
+ssc_DO_sur_mean_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_mean_sur", fun=mean)
+ssc_DO_sur_min_rast <- terra::rasterize(year_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_surf_points), res=500),field = "DO_min_sur", fun=mean)
+
+
+#subset the year data by these start and end year, and just 10m values
+Year_10_sub <- SSC_year_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht > 2)
+#Summarise the predictor into the desired climatologies for the entire time period
+year_10_summary <- Year_10_sub %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(TAlk_mean_10 = mean(TAlkmean, na.rm = TRUE), 
+                   DO_mean_10 = mean(DOmean, na.rm = TRUE), DO_min_10 = mean(DOmin, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+year_10_summary_grid <- dplyr::full_join(year_10_summary, SSC_dfo_year_grid, by=c("x","y")) %>% na.omit() 
+
+#Convert to spatial points and transform to grid crs
+year_10_points <- sf::st_as_sf(year_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_TAlk_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "TAlk_mean_10", fun=mean)%>%
+  terra::merge(ssc_TAlk_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_mean_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_mean_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_mean_rast, na.rm=TRUE)
+ssc_DO_10_min_rast <- terra::rasterize(year_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(year_10_points), res=500),field = "DO_min_10", fun=mean)%>%
+  terra::merge(ssc_DO_sur_min_rast, na.rm=TRUE)
+
+#### SalishSeaCast Monthly data for temperature and salinity####
+
+#subset the year data by these start and end year, and just surface values
+Month_surf_sub <- SSC_month_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht < 2)
+#Summarise the predictor by year
+month_surf_summary_year <- Month_surf_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_sur_year = mean(saltmean, na.rm = TRUE), salt_min_sur_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_sur_year = mean(tempmean, na.rm = TRUE), temp_max_sur_year = max(tempmean, na.rm = TRUE), temp_min_sur_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_surf_summary <- month_surf_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_sur = mean(salt_mean_sur_year, na.rm = TRUE), salt_min_sur = mean(salt_min_sur_year, na.rm = TRUE),
+                   temp_mean_sur = mean(temp_mean_sur_year, na.rm = TRUE), temp_max_sur = mean(temp_max_sur_year, na.rm = TRUE), temp_min_sur = mean(temp_min_sur_year, na.rm = TRUE))
+
+#Combine the above dataframe with the grid and filter out erroneous entries
+month_surf_summary_grid <- dplyr::full_join(month_surf_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_sur > 0)
+#Convert to spatial points and transform to grid crs
+month_surf_points <- sf::st_as_sf(month_surf_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_mean_sur", fun=mean)
+ssc_temp_sur_max_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_max_sur", fun=mean)
+ssc_temp_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "temp_min_sur", fun=mean)
+ssc_salt_sur_mean_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_mean_sur", fun=mean)
+ssc_salt_sur_min_rast <- terra::rasterize(month_surf_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_surf_points), res=500),field = "salt_min_sur", fun=mean)
+
+#subset the year data by these start and end year, and just 5m values
+Month_10_sub <- SSC_month_data %>% 
+  dplyr::filter(year >= start & year <= end,
+                deptht > 2)
+
+#Summarise the predictor by year
+month_10_summary_year <- Month_10_sub %>% dplyr::group_by(x, y, year) %>% 
+  dplyr::summarise(salt_mean_10_year = mean(saltmean, na.rm = TRUE), salt_min_10_year = min(saltmean, na.rm = TRUE),
+                   temp_mean_10_year = mean(tempmean, na.rm = TRUE), temp_max_10_year = max(tempmean, na.rm = TRUE), temp_min_10_year = min(tempmean, na.rm = TRUE))
+
+#Summarise the predictor into the desired climatologies for the entire time period
+month_10_summary <- month_10_summary_year %>% dplyr::group_by(x, y) %>% 
+  dplyr::summarise(salt_mean_10 = mean(salt_mean_10_year, na.rm = TRUE), salt_min_10 = mean(salt_min_10_year, na.rm = TRUE),
+                   temp_mean_10 = mean(temp_mean_10_year, na.rm = TRUE), temp_max_10 = mean(temp_max_10_year, na.rm = TRUE), temp_min_10 = mean(temp_min_10_year, na.rm = TRUE))
+
+#Combine the above dataframe with the NH4 grid and filter out erroneous entries
+month_10_summary_grid <- dplyr::full_join(month_10_summary, SSC_dfo_month_grid, by=c("x","y")) %>% na.omit() %>% dplyr::filter(salt_mean_10 > 0)
+#Convert to spatial points and transform to grid crs
+month_10_points <- sf::st_as_sf(month_10_summary_grid, coords=(c("nav_lon", "nav_lat")), crs = sf::st_crs(4326)) %>% sf::st_transform(crs = sf::st_crs(3573))
+#Rasterize all  predictors of intrerest onto the 500m equal area grid (size of salishseacast pixels) with mean = akin to project, merge with surface values because loose very shallow areas
+ssc_temp_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_mean_10", fun=mean) %>%
+  terra::merge(ssc_temp_sur_mean_rast, na.rm=TRUE)
+ssc_temp_10_max_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_max_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_max_rast, na.rm=TRUE)
+ssc_temp_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "temp_min_10", fun=mean)%>%
+  terra::merge(ssc_temp_sur_min_rast, na.rm=TRUE)
+ssc_salt_10_mean_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_mean_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_mean_rast, na.rm=TRUE)
+ssc_salt_10_min_rast <- terra::rasterize(month_10_points, terra::rast(crs ="EPSG:3573", extent = terra::ext(month_10_points), res=500),field = "salt_min_10", fun=mean)%>%
+  terra::merge(ssc_salt_sur_min_rast, na.rm=TRUE)
+
+
+#Stack all of the layers together
+BCCM_layers <- c(bccm_TAlk_10_mean_rast, bccm_salt_10_mean_rast, bccm_salt_10_min_rast, bccm_temp_s_mean_rast, bccm_temp_s_max_rast, bccm_temp_s_min_rast, bccm_temp_10_mean_rast, bccm_temp_10_max_rast, 
+                 bccm_temp_10_min_rast, bccm_do_10_mean_rast, bccm_do_10_min_rast)
+
+#choose the reference raster for alignment (e.g., ssc_salt_10_mean_rast)
+reference_rast <- ssc_salt_10_mean_rast
+
+# Align ssc_TAlk_10_mean_rast first
+ssc_TAlk_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_mean_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+ssc_DO_10_min_rast <- terra::resample(ssc_TAlk_10_mean_rast, reference_rast)
+
+SSC_layers <- c(ssc_TAlk_10_mean_rast, ssc_salt_10_mean_rast, ssc_salt_10_min_rast, ssc_temp_sur_mean_rast, ssc_temp_sur_max_rast, ssc_temp_sur_min_rast, ssc_temp_10_mean_rast, ssc_temp_10_max_rast, ssc_temp_10_min_rast, ssc_DO_10_mean_rast, ssc_DO_10_min_rast)
+
+# resample (and reproject) onto DFO bathy grid
+BCCM_Resampled <- terra::sapp(BCCM_layers, function(x){
+  terra::focal(x,w=3, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#applied larger w to ssc layers otherwise was having bccm layers selected over ssc in nearshore shallow areas
+#extrapolation didn't seem too unreasonable 
+SSC_Resampled <- terra::sapp(SSC_layers, function(x){
+  terra::focal(x,w=7, fun = "mean", na.policy = "only", na.rm = TRUE) %>% terra::project(DEM_100, method="cubicspline") 
+})
+
+#merge ssc and bccm layers, chooses ssc layer over bccm if present in same cells. Mask it by bathy layer
+TAlk_10_mean_rast <- terra::merge(SSC_Resampled[[1]], BCCM_Resampled[[1]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_mean_rast <- terra::merge(SSC_Resampled[[2]], BCCM_Resampled[[2]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+salt_10_min_rast <- terra::merge(SSC_Resampled[[3]], BCCM_Resampled[[3]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_mean_rast <- terra::merge(SSC_Resampled[[4]], BCCM_Resampled[[4]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_max_rast <- terra::merge(SSC_Resampled[[5]], BCCM_Resampled[[5]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_s_min_rast <- terra::merge(SSC_Resampled[[6]], BCCM_Resampled[[6]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_mean_rast <- terra::merge(SSC_Resampled[[7]], BCCM_Resampled[[7]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+temp_10_max_rast <- terra::merge(SSC_Resampled[[8]], BCCM_Resampled[[8]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100) 
+temp_10_min_rast <- terra::merge(SSC_Resampled[[9]], BCCM_Resampled[[9]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_mean_rast <- terra::merge(SSC_Resampled[[10]], BCCM_Resampled[[10]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+do_10_min_rast <- terra::merge(SSC_Resampled[[11]], BCCM_Resampled[[11]], na.rm=TRUE) %>% terra::mask(DEM_100) %>% terra::crop(DEM_100)
+
+
+Predictor_Hindcast_Climatologies <- c(TAlk_10_mean_rast, salt_10_mean_rast, salt_10_min_rast, temp_s_mean_rast, temp_s_max_rast, temp_s_min_rast, temp_10_mean_rast, temp_10_max_rast, temp_10_min_rast, do_10_mean_rast, do_10_min_rast)
+
+#Combine BCCM climatologies with the static predictor layers created previously to create  full hindcast predictor layer stack
+Predictor_Hindcast_Climatologies <- Predictor_Hindcast_Climatologies
+add(Predictor_Hindcast_Climatologies) <- Current_100
+add(Predictor_Hindcast_Climatologies) <- REI_100
+add(Predictor_Hindcast_Climatologies) <- Rock_100
+add(Predictor_Hindcast_Climatologies) <- Slope_100
+add(Predictor_Hindcast_Climatologies) <- DEM_100
+
+names(Predictor_Hindcast_Climatologies) <- c("TAlk_10m_mean", "salt_10m_mean", "salt_10m_min",  "temp_s_mean", "temp_s_max", "temp_s_min", "temp_10m_mean", "temp_10m_max",  "temp_10m_min", "do_10m_mean", "do_10m_min", "Current", "REI", "Rock", "Slope", "Depth")
+
+
+#Save the hindcast predictor raster
+terra::writeRaster(Predictor_Hindcast_Climatologies, "processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_2006.tif", overwrite = TRUE)
+```
+
+## Assess the environmental data for the overall hindcast period for autocorrelation in the variables to determine the ideal size of spatial blocks when splitting data into cross-validation (CV) folds
+```{r}
+#Reload in hindcast climatology
+Hindcast_Climatology <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif")
+
+#Set seed
+set.seed(1237)
+
+#Determine range of autocorrelation in predictor variables
+Autocor <- blockCV::cv_spatial_autocor(r = Hindcast_Climatology, num_sample = 10000, plot = TRUE)
+#Save the plot
+ggsave2(filename = "./Plots/AutoCorr_Plot.jpeg", plot_grid(Autocor$plots$barchart, Autocor$plots$map_plot, nrow = 1, labels = "auto"), scale = 1, height = 100, width = 175, units = "mm")
+plot(Autocor$variograms[[3]]) #look at variograms for fun
+
+# This recommends a 170000 m block size to be used for spatial blocking later. I have extended this to avoid edge effects
+Block_Size <- 170000 #CODEEDIT to adjust block size for the species if needed 
+
+gc()
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

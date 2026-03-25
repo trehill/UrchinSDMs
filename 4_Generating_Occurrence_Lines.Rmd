@@ -1,0 +1,552 @@
+---
+title: "Generating_Occurrence_Lines"
+author: "Tessa Rehill"
+date: "2025-01-23"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load libraries
+```{r}
+library(dplyr)
+library(tidyverse)
+library(terra)
+library(sf)
+library(ggspatial)
+library(cowplot)
+library(patchwork)
+```
+
+#Load data
+```{r}
+Urchin_Presence_Final <- read.csv("./processed_data/Survey_Datasets/presence_only.csv")
+```
+
+#Change start/end coordinates 
+```{r}
+#Loop through the urchin presence dataframe. Wherever there is an NA for end coords, put in the start coords
+#Also add a column for record number
+for (i in 1:length(Urchin_Presence_Final$survey_type)){
+  if (is.na(Urchin_Presence_Final$end_lat[i])){
+    Urchin_Presence_Final$end_lat[i] <- Urchin_Presence_Final$start_lat[i]
+  }
+  if (is.na(Urchin_Presence_Final$end_lon[i])){
+    Urchin_Presence_Final$end_lon[i] <- Urchin_Presence_Final$start_lon[i]
+  }
+  Urchin_Presence_Final$RecordNum[i] <- i 
+}
+
+#Loop back through and ensure no end and start lat and long are the exact same
+for (i in 1:length(Urchin_Presence_Final$site)){
+  if (Urchin_Presence_Final$start_lat[i] == Urchin_Presence_Final$end_lat[i]){
+    Urchin_Presence_Final$end_lat[i] <- Urchin_Presence_Final$end_lat[i] + 0.000001
+  }
+  if (Urchin_Presence_Final$start_lon[i] == Urchin_Presence_Final$end_lon[i]){
+    Urchin_Presence_Final$end_lon[i] <- Urchin_Presence_Final$end_lon[i] + 0.000001
+  }
+}
+
+```
+
+# Plot the depth distribution of urchin records from the datasets
+This is to done to get an idea of generally how deep these species are occurring to validate the cutoffs that we selected when clamping our bathymetry during predictor layer creation.
+```{r}
+#Load in required data
+BC_Mask <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project("epsg:3005")
+
+#Trim to the surveys used in the BC region
+Urchin_Presence_Final_Points <- sf::st_as_sf(Urchin_Presence_Final, coords = c("start_lon", "start_lat")) %>% sf::st_set_crs(4326)
+Urchin_Presence_Final_Vect <- terra::vect(Urchin_Presence_Final_Points) %>% terra::project(crs(BC_Mask)) %>% terra::mask(BC_Mask)
+Urchin_Presence_Final_df <- terra::as.data.frame(Urchin_Presence_Final_Vect)
+
+#How many records for each species?
+Urchin_Record_Nums <- Urchin_Presence_Final_df %>% dplyr::group_by(species) %>% dplyr::summarise(n())
+
+Depth_Plot_presence <- ggplot(Urchin_Presence_Final_df, aes(x = depth)) +
+  theme_cowplot() +
+  geom_boxplot() +
+  xlab("Depth (m)") +
+  ylab("Species Presence") +
+  geom_vline(xintercept = 18, linetype = "dashed", color = "black", linewidth = 0.75)
+  #dashed line at 18m 
+Depth_Plot_presence
+ggsave2(filename = "./Plots/Depth/urchin_presence_depth_plot.jpeg", plot = Depth_Plot_presence, scale = 1, height = 100, width = 175, units = "mm")
+```
+
+# For each species create a dataset that has one record per cell of the study area grid being used
+
+## Create Urchin occurrence lines for each record, extract intersected cells and associate Urchin records with the intersected cell closest in depth to its in situ value.
+
+```{r}
+#Load the bathymetry data being used for SDMs
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#Create a dataframe of all the Urchin start and end points in long form 
+Start_Points <- Urchin_Presence_Final %>% dplyr::select(-end_lat, -end_lon) 
+End_Points <- Urchin_Presence_Final %>% dplyr::select(-start_lat, -start_lon)
+names(Start_Points) <- c("survey_type", "transect", "site", "lat", "lon", "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "occurrence", "RecordNum")
+names(End_Points) <- c("survey_type", "transect", "site", "lat", "lon", "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "occurrence", "RecordNum")
+
+Urchin_df <- rbind(Start_Points, End_Points) #depth only greater than 3
+Urchin_df <- Urchin_df %>% arrange(RecordNum) #depth only greater than 3
+
+#Create an sf dataframe of points using lat/long data
+Urchin_Points <- Urchin_df %>% sf::st_as_sf(coords = c("lon", "lat")) %>% sf::st_set_crs(4326) 
+#Cast this into linestrings grouped by record number
+Urchin_Transects <- Urchin_Points %>% group_by(survey_type, site, transect, year, month, day, max_depth, min_depth, depth, substrate, species, RecordNum) %>% summarize(o = sum(occurrence))%>% st_cast("LINESTRING") #
+#re-sort Urchin transects by recordnum
+Urchin_Transects <- Urchin_Transects %>% arrange(RecordNum)
+
+#write the occurrence lines to a shapefile
+sf::st_write(Urchin_Transects, "./processed_data/Urchin_Presence/Urchin_Occurrence_Transects.shp", append = FALSE, overwrite = TRUE)
+
+```
+
+##Associate with single bathymetry cell 
+```{r}
+
+#Import the occurrence lines as a SpatVector
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#Urchin_Transects <- terra::vect("./processed_data/Urchin_Presence/Urchin_Occurrence_Transects.shp") %>% 
+#terra::project(crs(Bathymetry)) #%>% filter(depth >= 0) #Reproject the Lines to the crs of the bathymetry, remove all occurences above Canadian Chart Datum
+
+###
+Urchin_Transects <- terra::vect("./processed_data/Urchin_Presence/Urchin_Occurrence_Transects.shp") #read in file
+
+Urchin_Transects <- terra::project(Urchin_Transects, crs(Bathymetry)) #match CRS of bathymetry 
+
+#remove depth >=0  in urchin transects (removing all occurrences above Canadian Chart Datum)
+Urchin_Transects <- Urchin_Transects[Urchin_Transects$depth >= 0, ]
+
+###
+#Extract the cell numbers for all intersected cells in the bathymetry layer
+Extract_cells <- as.data.frame(cells(Bathymetry, Urchin_Transects, touches = TRUE))
+
+#Initialize Columns in the Urchin Transect Data that will be used in the following loop
+Urchin_Transects <- sf::st_as_sf(Urchin_Transects)
+Urchin_Transects$CellNum <- 0 
+Urchin_Transects$CellDepth <- 1000
+
+
+#Loop through all records and compare to each cell depth they intersect to select a best cell to represent each presence point
+for (i in 1:length(Urchin_Transects$srvy_ty)){
+  Records <- Extract_cells %>% filter(ID == i)
+  actual_depth <- as.numeric(Urchin_Transects$depth[i]) 
+  for (j in 1:length(Records$ID)){
+    cell_depth <- as.numeric(-Bathymetry$WEST_COAST_DEM2[Records[j,2]])
+    if (!is.na(cell_depth)){
+      if (j == 1){
+        Urchin_Transects$CellNum[i] <- Records[j,2]
+        Urchin_Transects$CellDepth[i] <- cell_depth
+      }
+      if (abs(actual_depth-cell_depth)<abs(actual_depth-as.numeric(Urchin_Transects$CellDepth[i]))){
+        Urchin_Transects$CellNum[i] <- Records[j,2]
+        Urchin_Transects$CellDepth[i] <- cell_depth
+      }
+    }
+  }
+}
+
+
+#Filter out the occurrences that have zeros in the CellNum column still as this means they aren't within any cells
+Urchin_Transects_Filtered <- sf::st_as_sf(Urchin_Transects) %>% filter(CellNum != 0)
+Urchin_Transects_Filtered_Vect <- terra::vect(Urchin_Transects_Filtered)
+terra::writeVector(Urchin_Transects_Filtered_Vect, "./processed_data/Urchin_Presence/Urchin_Occurrence_Transects_Filtered.shp", overwrite = TRUE)
+
+summary(Urchin_Transects_Filtered)
+
+```
+
+#Look at dataset 
+```{r}
+# Read in the shapefile as a SpatVector
+Urchin_Transects_Filtered_Vect <- vect("./processed_data/Urchin_Presence/Urchin_Occurrence_Transects_Filtered.shp")
+
+# Convert to a dataframe
+Urchin_Transects_df <- as.data.frame(Urchin_Transects_Filtered_Vect)
+
+
+summary_table <- Urchin_Transects_df %>%
+  group_by(species, srvy_ty) %>%
+  summarise(n = n(), .groups = "drop")
+
+print(summary_table)
+
+#write.csv(summary_table, "./processed_data/Survey_Datasets/Presence_SurveyType_Summary.csv", row.names = FALSE)
+
+summary_table <- Urchin_Transects_df %>%
+  group_by(year, srvy_ty) %>%
+  summarise(n = n(), .groups = "drop")
+
+
+```
+
+
+#Generating Urchin Counts ###
+#Load data
+```{r}
+Urchin_Count_Final <- read.csv("./processed_data/Survey_Datasets/actual_density.csv")
+```
+
+#Change start/end coordinates 
+```{r}
+#Loop through the urchin Count dataframe. Wherever there is an NA for end coords, put in the start coords
+#Also add a column for record number
+for (i in 1:length(Urchin_Count_Final$survey_type)){
+  if (is.na(Urchin_Count_Final$end_lat[i])){
+    Urchin_Count_Final$end_lat[i] <- Urchin_Count_Final$start_lat[i]
+  }
+  if (is.na(Urchin_Count_Final$end_lon[i])){
+    Urchin_Count_Final$end_lon[i] <- Urchin_Count_Final$start_lon[i]
+  }
+  Urchin_Count_Final$RecordNum[i] <- i 
+}
+
+#Loop back through and ensure no end and start lat and long are the exact same
+for (i in 1:length(Urchin_Count_Final$site)){
+  if (Urchin_Count_Final$start_lat[i] == Urchin_Count_Final$end_lat[i]){
+    Urchin_Count_Final$end_lat[i] <- Urchin_Count_Final$end_lat[i] + 0.000001
+  }
+  if (Urchin_Count_Final$start_lon[i] == Urchin_Count_Final$end_lon[i]){
+    Urchin_Count_Final$end_lon[i] <- Urchin_Count_Final$end_lon[i] + 0.000001
+  }
+}
+
+```
+
+# Plot the depth distribution of urchin records from the datasets
+This is to done to get an idea of generally how deep these species are occurring to validate the cutoffs that we selected when clamping our bathymetry during predictor layer creation.
+```{r}
+#Load in required data
+BC_Mask <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project("epsg:3005")
+
+#Trim to the surveys used in the BC region
+Urchin_Count_Final_Points <- sf::st_as_sf(Urchin_Count_Final, coords = c("start_lon", "start_lat")) %>% sf::st_set_crs(4326)
+Urchin_Count_Final_Vect <- terra::vect(Urchin_Count_Final_Points) %>% terra::project(crs(BC_Mask)) %>% terra::mask(BC_Mask)
+Urchin_Count_Final_df <- terra::as.data.frame(Urchin_Count_Final_Vect)
+
+#How many records for each species?
+Urchin_Record_Nums <- Urchin_Count_Final_df %>% dplyr::group_by(species) %>% dplyr::summarise(n())
+
+Depth_Plot_count <- ggplot(Urchin_Count_Final_df, aes(x = "", y = depth)) +
+  theme_cowplot() +
+  geom_boxplot(fill = "white") +
+  scale_y_continuous(limits = c(0, 30), expand = expansion(mult = c(0, 0.05))) +
+  xlab("Species Density") +
+  ylab("Depth (m)") +
+  geom_hline(yintercept = 18, linetype = "dashed", color = "black", linewidth = 0.75) +
+  coord_flip()
+
+Depth_Plot_count
+
+ggsave2(filename = "./Plots/Depth/count_urchin_depth_lot.jpeg", plot = Depth_Plot_count, scale = 1, height = 100, width = 175, units = "mm")
+
+
+```
+
+# For each species create a dataset that has one record per cell of the study area grid being used
+
+## Create Urchin occurrence lines for each record, extract intersected cells and associate Urchin records with the intersected cell closest in depth to its in situ value.
+
+```{r}
+#Load the bathymetry data being used for SDMs
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#Create a dataframe of all the Urchin start and end points in long form 
+Start_Points <- Urchin_Count_Final %>% dplyr::select(-end_lat, -end_lon) 
+End_Points <- Urchin_Count_Final %>% dplyr::select(-start_lat, -start_lon)
+names(Start_Points) <- c("survey_type", "transect", "site", "lat", "lon", "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "density_m2", "RecordNum")
+names(End_Points) <- c("survey_type", "transect", "site", "lat", "lon", "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "density_m2", "RecordNum")
+
+Urchin_df <- rbind(Start_Points, End_Points) #depth only greater than 3
+Urchin_df <- Urchin_df %>% arrange(RecordNum) #depth only greater than 3
+
+#Create an sf dataframe of points using lat/long data
+Urchin_Points <- Urchin_df %>% sf::st_as_sf(coords = c("lon", "lat")) %>% sf::st_set_crs(4326) 
+
+#Cast this into linestrings grouped by record number
+Urchin_Transects <- Urchin_Points %>% group_by(survey_type, site, transect, year, month, day, max_depth, min_depth, depth, substrate, species, RecordNum) %>% summarize(density = sum(density_m2))%>% st_cast("LINESTRING") #
+#re-sort Urchin transects by recordnum
+Urchin_Transects <- Urchin_Transects %>% arrange(RecordNum)
+
+#write the occurrence lines to a shapefile
+sf::st_write(Urchin_Transects, "./processed_data/Urchin_Count/Urchin_Count_Transects.shp", append = FALSE, overwrite = TRUE)
+
+```
+
+##Associate with single bathymetry cell 
+```{r}
+
+#Import the occurrence lines as a SpatVector
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#Urchin_Transects <- terra::vect("./processed_data/Urchin_Count/Urchin_Count_Transects.shp") %>% 
+#terra::project(crs(Bathymetry)) %>% filter(depth >= 0) #Reproject the Lines to the crs of the bathymetry, remove all occurences above Canadian Chart Datum
+
+###
+Urchin_Transects <- terra::vect("./processed_data/Urchin_Count/Urchin_Count_Transects.shp") #read in file
+
+Urchin_Transects <- terra::project(Urchin_Transects, crs(Bathymetry)) #match CRS of bathymetry 
+
+#remove depth >=0  in urchin transects (removing all occurrences above Canadian Chart Datum)
+Urchin_Transects <- Urchin_Transects[Urchin_Transects$depth >= 0, ]
+
+###
+#Extract the cell numbers for all intersected cells in the bathymetry layer
+Extract_cells <- as.data.frame(cells(Bathymetry, Urchin_Transects, touches = TRUE))
+
+#Initialize Columns in the Urchin Transect Data that will be used in the following loop
+Urchin_Transects <- sf::st_as_sf(Urchin_Transects)
+Urchin_Transects$CellNum <- 0 
+Urchin_Transects$CellDepth <- 1000
+
+
+#Loop through all records and compare to each cell depth they intersect to select a best cell to represent each Count point
+for (i in 1:length(Urchin_Transects$srvy_ty)){
+  Records <- Extract_cells %>% filter(ID == i)
+  actual_depth <- as.numeric(Urchin_Transects$depth[i]) 
+  for (j in 1:length(Records$ID)){
+    cell_depth <- as.numeric(-Bathymetry$WEST_COAST_DEM2[Records[j,2]])
+    if (!is.na(cell_depth)){
+      if (j == 1){
+        Urchin_Transects$CellNum[i] <- Records[j,2]
+        Urchin_Transects$CellDepth[i] <- cell_depth
+      }
+      if (abs(actual_depth-cell_depth)<abs(actual_depth-as.numeric(Urchin_Transects$CellDepth[i]))){
+        Urchin_Transects$CellNum[i] <- Records[j,2]
+        Urchin_Transects$CellDepth[i] <- cell_depth
+      }
+    }
+  }
+}
+
+
+#Filter out the occurrences that have zeros in the CellNum column still as this means they aren't within any cells
+Urchin_Transects_Filtered <- sf::st_as_sf(Urchin_Transects) %>% filter(CellNum != 0)
+Urchin_Transects_Filtered_Vect <- terra::vect(Urchin_Transects_Filtered)
+terra::writeVector(Urchin_Transects_Filtered_Vect, "./processed_data/Urchin_Count/Urchin_Count_Transects_Filtered.shp", overwrite = TRUE)
+
+summary(Urchin_Transects_Filtered_Vect)
+
+```
+
+#Look at dataset 
+```{r}
+# Read in the shapefile as a SpatVector
+Urchin_Transects_Filtered_Vect <- vect("./processed_data/Urchin_Count/Urchin_Count_Transects_Filtered.shp")
+
+# Convert to a dataframe
+Urchin_Transects_df <- as.data.frame(Urchin_Transects_Filtered_Vect)
+
+
+summary_table <- Urchin_Transects_df %>%
+  group_by(species, srvy_ty) %>%
+  summarise(n = n(), .groups = "drop")
+
+print(summary_table)
+
+#write.csv(summary_table, "./processed_data/Survey_Datasets/Count_SurveyType_Summary.csv", row.names = FALSE)
+
+summary_table <- Urchin_Transects_df %>%
+  group_by(year, srvy_ty) %>%
+  summarise(n = n(), .groups = "drop")
+
+
+```
+
+#Generating Urchin Relative Densities ###
+#Load data
+```{r}
+Urchin_RD_Final <- read.csv("./processed_data/Survey_Datasets/relative_density.csv")
+```
+
+
+#Change start/end coordinates 
+```{r}
+#Loop through the urchin RD dataframe. Wherever there is an NA for end coords, put in the start coords
+#Also RDd a column for record number
+for (i in 1:length(Urchin_RD_Final$survey_type)){
+  if (is.na(Urchin_RD_Final$end_lat[i])){
+    Urchin_RD_Final$end_lat[i] <- Urchin_RD_Final$start_lat[i]
+  }
+  if (is.na(Urchin_RD_Final$end_lon[i])){
+    Urchin_RD_Final$end_lon[i] <- Urchin_RD_Final$start_lon[i]
+  }
+  Urchin_RD_Final$RecordNum[i] <- i 
+}
+
+#Loop back through and ensure no end and start lat and long are the exact same
+for (i in 1:length(Urchin_RD_Final$site)){
+  if (Urchin_RD_Final$start_lat[i] == Urchin_RD_Final$end_lat[i]){
+    Urchin_RD_Final$end_lat[i] <- Urchin_RD_Final$end_lat[i] + 0.000001
+  }
+  if (Urchin_RD_Final$start_lon[i] == Urchin_RD_Final$end_lon[i]){
+    Urchin_RD_Final$end_lon[i] <- Urchin_RD_Final$end_lon[i] + 0.000001
+  }
+}
+
+```
+
+# Plot the depth distribution of urchin records from the datasets
+This is to done to get an idea of generally how deep these species are occurring to validate the cutoffs that we selected when clamping our bathymetry during predictor layer creation.
+```{r}
+#Load in required data
+BC_Mask <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project("epsg:3005")
+
+#Trim to the surveys used in the BC region
+Urchin_RD_Final_Points <- sf::st_as_sf(Urchin_RD_Final, coords = c("start_lon", "start_lat")) %>% sf::st_set_crs(4326)
+Urchin_RD_Final_Vect <- terra::vect(Urchin_RD_Final_Points) %>% terra::project(crs(BC_Mask)) %>% terra::mask(BC_Mask)
+Urchin_RD_Final_df <- terra::as.data.frame(Urchin_RD_Final_Vect)
+
+#How many records for each species?
+Urchin_Record_Nums <- Urchin_RD_Final_df %>% dplyr::group_by(species) %>% dplyr::summarise(n())
+
+Depth_Plot_RD<- ggplot(Urchin_RD_Final_df, aes(x = "", y = depth)) +
+  theme_cowplot() +
+  geom_boxplot(fill = "white") +
+  scale_y_continuous(limits = c(0, 30), expand = expansion(mult = c(0, 0.05))) +
+  xlab("Species Relative Abundance") +
+  ylab("Depth (m)") +
+  geom_hline(yintercept = 18, linetype = "dashed", color = "black", linewidth = 0.75) +
+  coord_flip()
+
+Depth_Plot_RD
+
+ggsave2(filename = "./Plots/Depth/rd_urchin_depth_lot.jpeg", plot = Depth_Plot_RD, scale = 1, height = 100, width = 175, units = "mm")
+```
+
+# For each species create a dataset that has one record per cell of the study area grid being used
+
+## Create Urchin occurrence lines for each record, extract intersected cells and associate Urchin records with the intersected cell closest in depth to its in situ value.
+
+```{r}
+#Load the bathymetry data being used for SDMs
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#Create a dataframe of all the Urchin start and end points in long form 
+Start_Points <- Urchin_RD_Final %>% dplyr::select(-end_lat, -end_lon) 
+End_Points <- Urchin_RD_Final %>% dplyr::select(-start_lat, -start_lon)
+names(Start_Points) <- c("survey_type", "transect", "site", "lat", "lon", "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "Abundance", "RecordNum")
+names(End_Points) <- c("survey_type", "transect", "site", "lat", "lon", "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "Abundance", "RecordNum")
+
+Urchin_df <- rbind(Start_Points, End_Points) #depth only greater than 3
+Urchin_df <- Urchin_df %>% arrange(RecordNum) #depth only greater than 3
+
+#Create an sf dataframe of points using lat/long data
+Urchin_Points <- Urchin_df %>% sf::st_as_sf(coords = c("lon", "lat")) %>% sf::st_set_crs(4326) 
+
+# Custom function to get the most common category
+get_mode <- function(x) {
+  x <- na.omit(x)  # Remove NA values
+  if (length(x) == 0) return(NA)  # Return NA if no valid entries
+  return(names(sort(table(x), decreasing = TRUE))[1])  # Most common category
+}
+
+Urchin_Transects <- Urchin_Points %>%
+  group_by(survey_type, site, transect, year, month, day, max_depth, min_depth, depth, substrate, species, RecordNum) %>%
+  summarize(density = get_mode(Abundance), .groups = "drop") %>%  # Use custom mode function
+  st_cast("LINESTRING")
+
+#re-sort Urchin transects by recordnum
+Urchin_Transects <- Urchin_Transects %>% arrange(RecordNum)
+
+#write the occurrence lines to a shapefile
+sf::st_write(Urchin_Transects, "./processed_data/Urchin_RDensity/Urchin_RDensity_Transects.shp", append = FALSE, overwrite = TRUE)
+
+```
+
+##Associate with single bathymetry cell 
+```{r}
+
+#Import the occurrence lines as a SpatVector
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#Urchin_Transects <- terra::vect("./processed_data/Urchin_RDensity/Urchin_RDensity_Transects.shp") %>% 
+#terra::project(crs(Bathymetry)) %>% filter(depth >= 0) #Reproject the Lines to the crs of the bathymetry, remove all occurences above Canadian Chart Datum
+
+###
+Urchin_Transects <- terra::vect("./processed_data/Urchin_RDensity/Urchin_RDensity_Transects.shp") #read in file
+
+Urchin_Transects <- terra::project(Urchin_Transects, crs(Bathymetry)) #match CRS of bathymetry 
+
+#remove depth >=0  in urchin transects (removing all occurrences above Canadian Chart Datum)
+Urchin_Transects <- Urchin_Transects[Urchin_Transects$depth >= 0, ]
+
+###
+#Extract the cell numbers for all intersected cells in the bathymetry layer
+Extract_cells <- as.data.frame(cells(Bathymetry, Urchin_Transects, touches = TRUE))
+
+#Initialize Columns in the Urchin Transect Data that will be used in the following loop
+Urchin_Transects <- sf::st_as_sf(Urchin_Transects)
+Urchin_Transects$CellNum <- 0 
+Urchin_Transects$CellDepth <- 1000
+
+
+#Loop through all records and compare to each cell depth they intersect to select a best cell to represent each RD point
+for (i in 1:length(Urchin_Transects$srvy_ty)){
+  Records <- Extract_cells %>% filter(ID == i)
+  actual_depth <- as.numeric(Urchin_Transects$depth[i]) 
+  for (j in 1:length(Records$ID)){
+    cell_depth <- as.numeric(-Bathymetry$WEST_COAST_DEM2[Records[j,2]])
+    if (!is.na(cell_depth)){
+      if (j == 1){
+        Urchin_Transects$CellNum[i] <- Records[j,2]
+        Urchin_Transects$CellDepth[i] <- cell_depth
+      }
+      if (abs(actual_depth-cell_depth)<abs(actual_depth-as.numeric(Urchin_Transects$CellDepth[i]))){
+        Urchin_Transects$CellNum[i] <- Records[j,2]
+        Urchin_Transects$CellDepth[i] <- cell_depth
+      }
+    }
+  }
+}
+
+
+#Filter out the occurrences that have zeros in the CellNum column still as this means they aren't within any cells
+Urchin_Transects_Filtered <- sf::st_as_sf(Urchin_Transects) %>% filter(CellNum != 0)
+Urchin_Transects_Filtered_Vect <- terra::vect(Urchin_Transects_Filtered)
+terra::writeVector(Urchin_Transects_Filtered_Vect, "./processed_data/Urchin_RDensity/Urchin_RDensity_Transects_Filtered.shp", overwrite = TRUE)
+
+summary(Urchin_Transects_Filtered_Vect)
+
+```
+
+#Look at dataset 
+```{r}
+# Read in the shapefile as a SpatVector
+Urchin_Transects_Filtered_Vect <- vect("./processed_data/Urchin_RDensity/Urchin_RDensity_Transects_Filtered.shp")
+
+# Convert to a dataframe
+Urchin_Transects_df <- as.data.frame(Urchin_Transects_Filtered_Vect)
+
+
+summary_table <- Urchin_Transects_df %>%
+  group_by(species, srvy_ty) %>%
+  summarise(n = n(), .groups = "drop")
+
+print(summary_table)
+
+#write.csv(summary_table, "./processed_data/Survey_Datasets/RD_SurveyType_Summary.csv", row.names = FALSE)
+
+summary_table <- Urchin_Transects_df %>%
+  group_by(year, srvy_ty) %>%
+  summarise(n = n(), .groups = "drop")
+
+
+```
+
+#Combining depth plots 
+```{r}
+
+all_depth <- Depth_Plot_presence / Depth_Plot_count / Depth_Plot_RD 
+
+ggsave2(filename = "./Plots/Depth/all_depth.jpeg", plot = all_depth, scale = 1, height = 200, width = 175, units = "mm")
+
+```
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

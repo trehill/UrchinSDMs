@@ -1,0 +1,1585 @@
+---
+title: "Generating_Datasets"
+author: "Tessa Rehill"
+output: html_document
+date: "2024-10-25"
+goal: 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load packages and data
+```{r}
+#load packages 
+library(dplyr)
+library(tidyr)
+library(lubridate)
+
+#read in data
+hakai<- read.csv("./raw_data/Hakai/quadrats_data.csv") #most up to date data (October 2024)
+
+hakai_sites <- read.csv("./raw_data/Hakai/hakai_sites.csv") #metadata on site location
+
+rls <- read.csv("./raw_data/RLS/IMOS_2.csv") #most up to date data (October 2024)
+
+dfo_count <- read.csv("./raw_data/DFO_surveys/Urchin_Count.csv")
+
+dfo_BHM <- read.csv("./raw_data/DFO_surveys/BHM_PA_algae_update.csv")
+  
+dfo_Msp <- read.csv("./raw_data/DFO_surveys/MSp_habitat_final.csv")
+
+dfo_GSU <- read.csv("./raw_data/DFO_surveys/GSU_habitat.csv") 
+
+dfo_transects <- read.csv("./raw_data/DFO_surveys/MERGED_TRANSECT_RA.csv") #transect data 
+
+ROV_counts <- read.csv("./processed_data/Baum_ROV/Baum_ROV_Urchin_Counts.csv") #transect data 
+
+#remove ALL BATI DATA 
+ROV_counts <- ROV_counts[ROV_counts$site != "Broughtons", ]
+
+```
+
+#Formatting Hakai Data 
+##Quadrat level summaries 
+```{r}
+#Species code for green urchin (gur), purple urchin (pur) and red urchin (rur) - Hakai
+#Total length refers to test diameter 
+
+#Filter the dataframe for habitat (rockyreef- this is where there is depth associated with quadrats)
+hakai_depth  <- hakai %>%
+  filter(survey_method %in% c('Rocky Reef', 'Both')) %>%
+  filter(!is.na(depth)) #remove all rows where depth is NA (not useful)
+
+#QUADRAT LEVEL SUMMARY 
+#Create a new column for pur, gur, rur counts, summarize by quadrat 
+#Create counts for each species by quadrat and site, including no observations
+hakai_depth_counts <- hakai_depth %>%
+  group_by(date, quadrat, site, depth) %>%
+  summarise(
+    gur_count = sum(species == "gur", na.rm = TRUE),
+    pur_count = sum(species == "pur", na.rm = TRUE),
+    rur_count = sum(species == "rur", na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+#Add a column that counts the number of quadrats per site (for area, and eventually density calculations)
+hakai_depth_counts <- hakai_depth_counts %>%
+  group_by(site, date) %>%
+  mutate(quadrat_count = n()) %>%  # count number of quadrats per site and date
+  ungroup()
+
+#Add lat and long
+hakai_depth_final <- hakai_depth_counts %>%
+  left_join(hakai_sites, by = "site")
+
+#Add presence/absence and add relative density and add absolute density 
+#Summarize quadrat level total urchin counts
+quadrat_level_summary <- hakai_depth_final %>%
+  group_by(date, site, quadrat) %>%
+  summarise(
+    total_gur = sum(gur_count, na.rm = TRUE),
+    total_pur = sum(pur_count, na.rm = TRUE),
+    total_rur = sum(rur_count, na.rm = TRUE)
+  ) %>%
+  # Add relative density, absolute density, and presence/absence columns
+  mutate(
+    # Relative density categories
+    rd_gur = case_when(
+      total_gur == 0 ~ "None",
+      total_gur > 0 & total_gur <= 10 ~ "Few",
+      total_gur > 10 & total_gur <= 100 ~ "Many",
+      total_gur > 100 ~ "Abundant"
+    ),
+    rd_pur = case_when(
+      total_pur == 0 ~ "None",
+      total_pur > 0 & total_pur <= 10 ~ "Few",
+      total_pur > 10 & total_pur <= 100 ~ "Many",
+      total_pur > 100 ~ "Abundant"
+    ),
+    rd_rur = case_when(
+      total_rur == 0 ~ "None",
+      total_rur > 0 & total_rur <= 10 ~ "Few",
+      total_rur > 10 & total_rur <= 100 ~ "Many",
+      total_rur > 100 ~ "Abundant"
+    ),
+    # Presence/absence indicators
+    p_gur = ifelse(total_gur > 0, 1, 0),  # 1 if present, 0 if absent
+    p_pur = ifelse(total_pur > 0, 1, 0),
+    p_rur = ifelse(total_rur > 0, 1, 0),
+    # Absolute density calculations
+    ad_gur = total_gur / 1,  # Absolute density for green urchins
+    ad_pur = total_pur / 1,   # Absolute density for purple urchins
+    ad_rur = total_rur / 1    # Absolute density for red urchins
+  )
+
+#Join the quadrat-level relative density back to the main dataframe
+quadrat_final <- hakai_depth_final %>%
+  left_join(quadrat_level_summary %>%
+              select(site, quadrat, rd_gur, rd_pur, rd_rur, date, ad_gur, ad_pur, ad_rur, p_gur, p_rur, p_pur),
+            by = c("site","date", "quadrat")) 
+
+#quadrat final, hakai_depth_final and quadrat_level_summary all have the same number of rows (180), no data being lost
+
+#Add 'survey_type' column with all values as 'Hakai'
+quadrat_final <- quadrat_final %>%
+  mutate(survey_type = 'Hakai')
+
+# Separate the date column into year, month, and day
+quadrat_final <- quadrat_final %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    day = day(date)
+  )
+
+# Rename columns
+quadrat_final <- quadrat_final %>%
+  rename(start_lat = lat, start_lon = lon, survey_id = quadrat)
+
+#update min and max depth based on pre-determined bins 
+#filter out any record with no depth data 
+quadrat_final <- quadrat_final %>% filter(!is.na(depth))
+#check the maximum and minimum depth of any record
+max(quadrat_final$depth) # it is 18 m
+min(quadrat_final$depth) # it is -5 m
+
+#Initialize the columns
+quadrat_final$max_depth <- NA
+quadrat_final$min_depth <- NA
+
+
+#loop through each row of the dataset and set a max and min depth based on the ROV dataset's depth bins
+for (i in 1:length(quadrat_final$site)){
+  if (quadrat_final$depth[i] >= -6 & quadrat_final$depth[i] < -3){
+    quadrat_final$max_depth[i] <- -3
+    quadrat_finalp$min_depth[i] <- -6
+  }
+  if (quadrat_final$depth[i] >= -3 & quadrat_final$depth[i] < 0){
+    quadrat_final$max_depth[i] <- 0
+    quadrat_final$min_depth[i] <- -3
+  }
+  if (quadrat_final$depth[i] >= 0 & quadrat_final$depth[i] < 3){
+    quadrat_final$max_depth[i] <- 3
+    quadrat_final$min_depth[i] <- 0
+  }
+  if (quadrat_final$depth[i] >= 3 & quadrat_final$depth[i] < 6){
+    quadrat_final$max_depth[i] <- 6
+    quadrat_final$min_depth[i] <- 3
+  }
+  if (quadrat_final$depth[i] >= 6 & quadrat_final$depth[i] < 9){
+    quadrat_final$max_depth[i] <- 9
+    quadrat_final$min_depth[i] <- 6
+  }
+  if (quadrat_final$depth[i] >= 9 & quadrat_final$depth[i] < 12){
+    quadrat_final$max_depth[i] <- 12
+   quadrat_final$min_depth[i] <- 9
+  }
+  if (quadrat_final$depth[i] >= 12 & quadrat_final$depth[i] < 15){
+    quadrat_final$max_depth[i] <- 15
+    quadrat_final$min_depth[i] <- 12
+  }
+  if (quadrat_final$depth[i] >= 15 & quadrat_final$depth[i] < 18){
+    quadrat_final$max_depth[i] <- 18
+    quadrat_final$min_depth[i] <- 15
+  }
+  if (quadrat_final$depth[i] >= 18 & quadrat_final$depth[i] < 21){
+    quadrat_final$max_depth[i] <- 21
+    quadrat_final$min_depth[i] <- 18
+  }
+}
+
+#Add columns to match other datasets but fill with NA 
+
+quadrat_final$substrate <- NA
+quadrat_final$end_lon <- NA
+quadrat_final$end_lat <- NA 
+
+#Reorder the columns to have survey_type, lat, and long at the beginning
+quadrat_final <- quadrat_final %>%
+  select(survey_type, survey_id, site, start_lat, start_lon, end_lat, end_lon, year, month, day, depth, min_depth, max_depth, substrate, everything(), -quadrat_count, -date)
+
+#write dataframe as a new file
+write.csv(quadrat_final, 
+          "./processed_data/Hakai/hakai_quadrat_summary.csv", 
+          row.names = FALSE)
+
+```
+
+#Formatting Hakai Data 
+##Site level summaries 
+```{r}
+##summarize to the site level (group each site and make calculations at this scale)
+##depth is an average
+
+#SITE LEVEL SUMMARY 
+#summarize site-level total urchin counts and depth statistics
+site_level_summary <- hakai_depth_final %>%
+  group_by(date, site) %>%
+  summarise(
+    total_gur = sum(gur_count, na.rm = TRUE),
+    total_pur = sum(pur_count, na.rm = TRUE),
+    total_rur = sum(rur_count, na.rm = TRUE),
+    depth = mean(depth, na.rm = TRUE),  # Average depth for each site and date
+    min_depth = min(depth, na.rm = TRUE),   # Minimum depth for each site and date
+    max_depth = max(depth, na.rm = TRUE),   # Maximum depth for each site and date
+    num_quadrats = n(),                     # Count the number of quadrats for each site and date
+    .groups = "drop"                        # Drop grouping after summarizing
+  ) %>%
+  # Add relative density, presence/absence columns, and absolute density calculations
+  mutate(
+    rd_gur = case_when(
+      total_gur == 0 ~ "None",
+      total_gur > 0 & total_gur <= 10 ~ "Few",
+      total_gur > 10 & total_gur <= 100 ~ "Many",
+      total_gur > 100 ~ "Abundant"
+    ),
+    rd_pur = case_when(
+      total_pur == 0 ~ "None",
+      total_pur > 0 & total_pur <= 10 ~ "Few",
+      total_pur > 10 & total_pur <= 100 ~ "Many",
+      total_pur > 100 ~ "Abundant"
+    ),
+    rd_rur = case_when(
+      total_rur == 0 ~ "None",
+      total_rur > 0 & total_rur <= 10 ~ "Few",
+      total_rur > 10 & total_rur <= 100 ~ "Many",
+      total_rur > 100 ~ "Abundant"
+    ),
+    # Add presence/absence columns
+    p_gur = ifelse(total_gur > 0, 1, 0),
+    p_pur = ifelse(total_pur > 0, 1, 0),
+    p_rur = ifelse(total_rur > 0, 1, 0),
+    # Calculate absolute density for each species
+    ad_gur = total_gur / num_quadrats,  # Absolute density for green urchins
+    ad_pur = total_pur / num_quadrats,  # Absolute density for purple urchins
+    ad_rur = total_rur / num_quadrats   # Absolute density for red urchins
+  )
+
+#Join the site-level relative density back to the main dataframe
+site_final <- site_level_summary %>%
+  left_join(
+    hakai_depth_final %>%
+      select(site, lat, lon) %>%     # Select only relevant columns
+      distinct(),                    # Keep only unique rows to avoid duplication
+    by = "site"                      # Join by 'site'
+  )
+
+#Add 'survey_type' column with all values as 'Hakai'
+site_final <- site_final %>%
+  mutate(survey_type = 'Hakai')
+
+#Add 'survey_id' column 
+site_final <- site_final %>%
+  mutate(survey_id = site)
+
+#Add 'survey_type' column with all values as 'Hakai'
+site_final <- site_final %>%
+  mutate(survey_type = 'Hakai')
+
+# Separate the date column into year, month, and day
+site_final <- site_final %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    day = day(date)
+  )
+
+#Add columns to match other datasets but fill with NA 
+site_final$substrate <- NA
+site_final$end_lon <- NA
+site_final$end_lat <- NA 
+
+#Reorder the columns to have survey_type, lat, and long at the beginning
+site_final <- site_final %>%
+  select(survey_type, survey_id, site, lat, lon, end_lat, end_lon, year, month, day, depth, min_depth, max_depth, substrate, everything(),-date, -num_quadrats)
+
+
+#Rename columns
+site_final <- site_final %>%
+  rename(start_lat = lat, start_lon = lon)
+
+
+#Write dataframe as a new file
+write.csv(site_final, 
+          "./processed_data/Hakai/hakai_site_summary.csv", 
+          row.names = FALSE)
+
+
+```
+
+#Formatting RLS data - transect summaries
+```{r}
+#A block refers to survey unit within site. There are two blocks along the same transect
+#A transect is 50m, with one block on the left 1m and another on the right 1m 
+#Depth is a mean
+#Survey ID = transect (includes both blocks)
+
+#Remove all rls data that does NOT contain depth information 
+rls <- rls[!is.na(rls$depth), ]
+
+#Define species names mapping to codes
+species_mapping <- c(
+  "Strongylocentrotus purpuratus" = "pur",
+  "Strongylocentrotus droebachiensis" = "gur",
+  "Mesocentrotus franciscanus" = "rur"
+)
+
+#Map relevant species to to shortened names
+#this new dataframe contains only data from rls WITH urchin species, but don't worry we include surveys later without! 
+rls_filtered <- rls %>%
+  filter(species_name %in% names(species_mapping)) %>%
+  mutate(
+    species_code = case_when(
+      species_name == "Strongylocentrotus purpuratus" ~ "pur",
+      species_name == "Strongylocentrotus droebachiensis" ~ "gur",
+      species_name == "Mesocentrotus franciscanus" ~ "rur"
+    )
+  )
+
+#TRANSECT LEVEL SUMMARY 
+#summarize depth at transect level, find mean depth within a block (for all transects)
+#survey ID is the same for transect, if min and max depth = depth, then fill with NA
+
+
+mean_depth_df <- rls %>%
+  group_by(survey_id) %>%
+  summarise(
+    depth = mean(depth, na.rm = TRUE))
+#add to urchin only data
+rls_transect <- rls %>%
+  left_join(mean_depth_df, by = "survey_id")
+
+#summarize counts of each urchin speceis by survey ID in rls filtered
+urchin_counts <- rls_filtered %>%
+  group_by(survey_id, species_code) %>%
+  summarise(total_urchins = sum(total, na.rm = TRUE)) %>%
+  ungroup()
+
+#pivot the data so that each species (gur, rur, pur) becomes a column
+urchin_counts_pivot <- urchin_counts %>%
+  pivot_wider(names_from = species_code, values_from = total_urchins, values_fill = 0)
+
+#Merge with the full rls dataframe to include surveys without urchins
+rls_summary <- rls_transect %>%
+  select(survey_id, site_name, latitude, longitude, survey_date, depth.y) %>%
+  distinct() %>%         # Keep only unique survey_ids
+  left_join(urchin_counts_pivot, by = "survey_id") %>%  # Merge with urchin counts
+  replace(is.na(.), 0)   # Replace NAs with 0 for surveys with no urchin counts
+
+
+#Rename columns 
+rls_summary <- rls_summary %>%
+  rename(
+    gur_count = gur,
+    pur_count = pur,
+    rur_count = rur,
+    site = site_name,
+    date = survey_date,
+    start_lat = latitude,
+    start_lon = longitude,
+    depth = depth.y
+  )
+
+#Create presence/absence columns for each species
+transect_summary <- rls_summary %>%
+  mutate(
+    p_gur = ifelse(gur_count > 0, 1, 0),
+    p_pur = ifelse(pur_count > 0, 1, 0),
+    p_rur = ifelse(rur_count > 0, 1, 0)
+  )
+
+# Add relative and actual density columns for each species
+transect_summary <- transect_summary %>%
+  mutate(
+    rd_gur = case_when(
+      gur_count == 0 ~ "None",
+      gur_count > 0 & gur_count <= 10 ~ "Few",
+      gur_count > 10 & gur_count <= 100 ~ "Many",
+      gur_count > 100 ~ "Abundant"
+    ),
+    rd_pur = case_when(
+      pur_count == 0 ~ "None",
+      pur_count > 0 & pur_count <= 10 ~ "Few",
+      pur_count > 10 & pur_count <= 100 ~ "Many",
+      pur_count > 100 ~ "Abundant"
+    ),
+    rd_rur = case_when(
+      rur_count == 0 ~ "None",
+      rur_count > 0 & rur_count <= 10 ~ "Few",
+      rur_count > 10 & rur_count <= 100 ~ "Many",
+      rur_count > 100 ~ "Abundant"
+    ),
+    # Add actual density columns for each species
+    ad_gur = gur_count / 100, #100 because there are 2 x 1 x 50m areas being surveyed (2 blocks)
+    ad_pur = pur_count / 100,
+    ad_rur = rur_count / 100
+  )
+
+
+# Add 'survey_type' column with all values as 'Hakai'
+transect_final <- transect_summary %>%
+  mutate(survey_type = 'RL_Survey')
+
+
+#Separate year month data values
+transect_final <- transect_final %>%
+  mutate(
+    year = year(date),
+    month = month(date),
+    day = day(date)
+  )
+
+
+#Add columns to match other datasets but fill with NA 
+transect_final$substrate <- NA
+transect_final$end_lat <- NA
+transect_final$end_lon <- NA
+
+
+#Initialize the columns
+transect_final$max_depth <- NA
+transect_final$min_depth <- NA
+
+
+#loop through each row of the dataset and set a max and min depth based on the ROV dataset's depth bins
+for (i in 1:length(transect_final$survey_id)){
+  if (transect_final$depth[i] >= -6 & transect_final$depth[i] < -3){
+    transect_final$max_depth[i] <- -3
+    transect_final$min_depth[i] <- -6
+  }
+  if (transect_final$depth[i] >= -3 & transect_final$depth[i] < 0){
+    transect_final$max_depth[i] <- 0
+    transect_final$min_depth[i] <- -3
+  }
+  if (transect_final$depth[i] >= 0 & transect_final$depth[i] < 3){
+    transect_final$max_depth[i] <- 3
+    transect_final$min_depth[i] <- 0
+  }
+  if (transect_final$depth[i] >= 3 & transect_final$depth[i] < 6){
+    transect_final$max_depth[i] <- 6
+    transect_final$min_depth[i] <- 3
+  }
+  if (transect_final$depth[i] >= 6 & transect_final$depth[i] < 9){
+    transect_final$max_depth[i] <- 9
+    transect_final$min_depth[i] <- 6
+  }
+  if (transect_final$depth[i] >= 9 & transect_final$depth[i] < 12){
+    transect_final$max_depth[i] <- 12
+   transect_final$min_depth[i] <- 9
+  }
+  if (transect_final$depth[i] >= 12 & transect_final$depth[i] < 15){
+    transect_final$max_depth[i] <- 15
+    transect_final$min_depth[i] <- 12
+  }
+  if (transect_final$depth[i] >= 15 & transect_final$depth[i] < 18){
+    transect_final$max_depth[i] <- 18
+    transect_final$min_depth[i] <- 15
+  }
+  if (transect_final$depth[i] >= 18 & transect_final$depth[i] < 21){
+    transect_final$max_depth[i] <- 21
+    transect_final$min_depth[i] <- 18
+  }
+}
+
+#Reorder the columns to have survey_type, lat, and long at the beginning
+transect_final <- transect_final %>%
+  select(survey_type, survey_id, site, start_lat, start_lon, end_lat, end_lon, year, month, day,depth, min_depth, max_depth, substrate, everything(),-date)
+
+
+#Write dataframe as a new file
+write.csv(transect_final , 
+          "./processed_data/RLS/RLS_transect_summary.csv", 
+          row.names = FALSE)
+
+```
+
+#Formatting DFO count data (GSU, RSU, and multispecies surveys)
+```{r}
+#Remove all NA values in depth and urchin counts 
+dfo_count <- dfo_count %>%
+  filter(!is.na(ChartDepth) & !is.na(CountRSU) & !is.na(CountPSU) & !is.na(CountGSU))
+
+#Make a new column that will serve as a unique identifier for each transect 
+dfo_count <- dfo_count %>%
+  group_by(Method, Year, Month, Day, LatitudeStart, LongitudeStart, TransectNum) %>%
+  mutate(HKey = cur_group_id()) %>% #this HKey is one that we have made and does not directly match the other datasets 
+  ungroup()  # Ungroup the data after creating HKey
+
+#make a new column that will serve as a unique identifier for each quadrat
+dfo_count <- dfo_count %>%
+  group_by(Method, Year, Month, Day, LatitudeStart, LongitudeStart, TransectNum, QuadratNum) %>%
+  mutate(QKey = cur_group_id()) %>%
+  ungroup()  # Ungroup the data after creating HKey
+
+#QUADRAT LEVEL SUMMARY ####
+#Rename the columns in the dfo_count dataframe
+dfo_summary <- dfo_count %>%
+  rename(
+    rur_count = CountRSU,
+    pur_count = CountPSU,
+    gur_count = CountGSU
+  )
+
+#Add a column that counts the number of quadrats per transect (for area, and eventually density calculations)
+dfo_summary<- dfo_summary %>%
+  group_by(HKey) %>%
+  mutate(quadrat_count = n()) %>%  # count number of quadrats per transect
+  ungroup()
+
+#Add presence/absence and add relative density and add absolute density 
+#Summarize quadrat level total urchin counts
+quadrat_level_summary <- dfo_summary %>%
+  group_by(QKey) %>%
+  summarise(
+    total_gur = sum(gur_count, na.rm = TRUE),
+    total_pur = sum(pur_count, na.rm = TRUE),
+    total_rur = sum(rur_count, na.rm = TRUE)
+  ) %>%
+  # Add relative density and absolute density columns
+  mutate(
+    rd_gur = case_when(
+      total_gur == 0 ~ "None",
+      total_gur > 0 & total_gur <= 10 ~ "Few",
+      total_gur > 10 & total_gur <= 100 ~ "Many",
+      total_gur > 100 ~ "Abundant"
+    ),
+    rd_pur = case_when(
+      total_pur == 0 ~ "None",
+      total_pur > 0 & total_pur <= 10 ~ "Few",
+      total_pur > 10 & total_pur <= 100 ~ "Many",
+      total_pur > 100 ~ "Abundant"
+    ),
+    rd_rur = case_when(
+      total_rur == 0 ~ "None",
+      total_rur > 0 & total_rur <= 10 ~ "Few",
+      total_rur > 10 & total_rur <= 100 ~ "Many",
+      total_rur > 100 ~ "Abundant"
+    ),
+    # Add presence/absence columns
+    p_gur = ifelse(total_gur > 0, 1, 0),
+    p_pur = ifelse(total_pur > 0, 1, 0),
+    p_rur = ifelse(total_rur > 0, 1, 0),
+    # Calculate absolute density for each species
+    ad_gur = total_gur / 1,  # Absolute density for green urchins
+    ad_pur = total_pur / 1,  # Absolute density for purple urchins
+    ad_rur = total_rur / 1   # Absolute density for red urchins
+  )
+
+#Join the quadrat-level relative density back to the main dataframe
+quadrat_final <- dfo_summary %>%
+  left_join(quadrat_level_summary %>%
+              select(QKey,rd_gur, rd_pur, rd_rur, ad_gur, ad_pur, ad_rur, p_gur, p_rur, p_pur),
+            by = c("QKey")) 
+
+#quadrat level summary has same number of quadrat (rows) as quadrat_final (no data lost)
+
+#Rename columns 
+quadrat_final <- quadrat_final %>%
+  rename(
+    start_lat = LatitudeStart,
+    start_lon = LongitudeStart,
+    depth = ChartDepth,
+    survey_type = SourceDB,
+    survey_id = QKey, 
+    site = HKey,
+    year = Year, 
+    month = Month, 
+    day = Day, 
+  )
+
+
+#Add columns from GSU + MSp (metadata files) that are relevant (we do not have this information for RSU)
+#How can we link dfoGSU and quadrat final together? - survey_type, site, QuadratNum, TransectNum, date (first need to separate date in dfo_GSU)
+
+#Separate date in GSU data
+dfo_GSU <- dfo_GSU %>%
+  mutate(
+    year = as.integer(format(as.Date(HDate), "%Y")),
+    month = as.integer(format(as.Date(HDate), "%m")),
+    day = as.integer(format(as.Date(HDate), "%d"))
+  )
+
+#There are zero values in latend and lonend of GSU dataset, we need to remove these and turn them into NA values 
+dfo_GSU <- dfo_GSU %>%
+  mutate(
+    LatEnd = ifelse(LatEnd == 0, NA, LatEnd),
+    LonEnd = ifelse(LonEnd == 0, NA, LonEnd)
+  )
+
+#Separate date in Msp data 
+dfo_Msp <- dfo_Msp %>%
+  separate(Time, into = c("year", "month", "day"), sep = "-| ", remove = FALSE) %>%
+  mutate(
+    year = as.integer(year),
+    month = as.integer(month),
+    day = as.integer(day)
+  )
+
+#We're going to first separate each survey type, add meta data, and then combine them at the end 
+#filter quadrat final for only methods GSU 
+quadrat_final_GSU <- quadrat_final %>% 
+  filter(survey_type == "GSU")
+
+#now for only MSP
+quadrat_final_MSP <- quadrat_final %>% 
+  filter(survey_type == "Multispecies")
+
+#now for only RSU 
+quadrat_final_RSU <- quadrat_final %>% 
+  filter(survey_type == "RSU")
+
+#perform a left join to bring in dfo_GSU data based on specified columns
+quadrat_final_GSU_matched <- quadrat_final_GSU %>%
+  left_join(
+    dfo_GSU %>%
+      select(LatStart, LonStart, year, ChartDepth, LatEnd, LonEnd, SubCat, SubSubCat,month, day, Quadrat) %>%
+      distinct(),
+    by = c("start_lat" = "LatStart", 
+           "start_lon" = "LonStart", 
+           "year" = "year", 
+           "month" = "month", 
+           "day" = "day", 
+           "depth" = "ChartDepth", 
+           "QuadratNum" = "Quadrat")  # Ensure mapping is correct
+  ) #same number of observations, no data lost 
+
+#rename columns to match end and start latitude 
+quadrat_final_GSU_matched <- quadrat_final_GSU_matched %>%
+  rename(
+    end_lat = LatEnd,
+    end_lon = LonEnd
+  )
+
+#Replace substrate category values with actual names for categories
+quadrat_final_GSU_matched <- quadrat_final_GSU_matched %>%
+  #Create the 'substrate' column by combining 'SubCat' and 'SubSubCat'
+  mutate(substrate = paste0(SubCat, SubSubCat)) %>%
+  #Recode the combined values
+  mutate(
+    substrate = case_when( #based on key 
+      substrate == "1a" ~ "Bedrock",
+      substrate == "1b" ~ "Boulder",
+      substrate == "2" ~ "Mixed",
+      substrate == "3a" ~ "Sand",
+      substrate == "3b" ~ "Mud",
+      TRUE ~ NA_character_  # Keep NA for any unmatched cases
+    )
+  )%>%
+  #Remove 'SubCat' and 'SubSubCat' columns
+  select(-SubCat, -SubSubCat)
+
+
+#perform a left join to bring dfo_Msp data based on specified columns 
+quadrat_final_MSP_matched <- quadrat_final_MSP %>%
+  left_join(
+    dfo_Msp %>%
+      select(latStart, lonStart, year, CorDepthM, latEnd, lonEnd, SubCat, SubSubCat, month, day, Quadrat) %>%
+      distinct(),
+    by = c("start_lat" = "latStart", 
+           "start_lon" = "lonStart", 
+           "year" = "year", 
+           "month" = "month", 
+           "day" = "day", 
+           "depth" = "CorDepthM", 
+           "QuadratNum" = "Quadrat")  # Ensure mapping is correct
+) #same number, no data lost 
+
+#rename columns to match end and start latitude 
+quadrat_final_MSP_matched <- quadrat_final_MSP_matched %>%
+  rename(
+    end_lat = latEnd,
+    end_lon = lonEnd
+  )
+
+#Replace substrate category values with actual names for categories
+quadrat_final_MSP_matched <- quadrat_final_MSP_matched %>%
+  #Create the 'substrate' column by combining 'SubCat' and 'SubSubCat'
+  mutate(substrate = paste0(SubCat, SubSubCat)) %>%
+  #Recode the combined values, based on key 
+  mutate(
+    substrate = case_when(
+      substrate == "1a" ~ "Bedrock",
+      substrate == "1b" ~ "Boulder",
+      substrate == "2" ~ "Mixed",
+      substrate == "3a" ~ "Sand",
+      substrate == "3b" ~ "Mud",
+      TRUE ~ NA_character_  #Keep NA for any unmatched cases
+    )
+  ) %>%
+  # Remove 'SubCat' and 'SubSubCat' columns
+  select(-SubCat, -SubSubCat)
+
+
+#we dont have additional data for RSU do this remains all NA 
+quadrat_final_RSU_matched <- quadrat_final_RSU %>%
+  mutate(
+    end_lat = NA,
+    end_lon = NA,
+    substrate = NA
+  )
+
+#quadrat final before combining data has 138312 rows 
+#now rbind them all back together, should have same amount of rows as original quadrat_final (138312)
+quadrat_final <- rbind(quadrat_final_RSU_matched, quadrat_final_GSU_matched, quadrat_final_MSP_matched) #same amount of rows, no data lost
+
+#survey type should be a combination of the database that it was extracted from and the method
+quadrat_final <- quadrat_final %>%
+  mutate(survey_type = paste(survey_type, Method, sep = "_"))
+  
+#Initialize the columns
+quadrat_final$max_depth <- NA
+quadrat_final$min_depth <- NA
+
+
+#loop through each row of the dataset and set a max and min depth based on the ROV dataset's depth bins
+for (i in 1:length(quadrat_final$Key)){
+  if (quadrat_final$depth[i] >= -6 & quadrat_final$depth[i] < -3){
+    quadrat_final$max_depth[i] <- -3
+    quadrat_final$min_depth[i] <- -6
+  }
+  if (quadrat_final$depth[i] >= -3 & quadrat_final$depth[i] < 0){
+    quadrat_final$max_depth[i] <- 0
+    quadrat_final$min_depth[i] <- -3
+  }
+  if (quadrat_final$depth[i] >= 0 & quadrat_final$depth[i] < 3){
+    quadrat_final$max_depth[i] <- 3
+    quadrat_final$min_depth[i] <- 0
+  }
+  if (quadrat_final$depth[i] >= 3 & quadrat_final$depth[i] < 6){
+    quadrat_final$max_depth[i] <- 6
+    quadrat_final$min_depth[i] <- 3
+  }
+  if (quadrat_final$depth[i] >= 6 & quadrat_final$depth[i] < 9){
+    quadrat_final$max_depth[i] <- 9
+    quadrat_final$min_depth[i] <- 6
+  }
+  if (quadrat_final$depth[i] >= 9 & quadrat_final$depth[i] < 12){
+    quadrat_final$max_depth[i] <- 12
+   quadrat_final$min_depth[i] <- 9
+  }
+  if (quadrat_final$depth[i] >= 12 & quadrat_final$depth[i] < 15){
+    quadrat_final$max_depth[i] <- 15
+    quadrat_final$min_depth[i] <- 12
+  }
+  if (quadrat_final$depth[i] >= 15 & quadrat_final$depth[i] < 18){
+    quadrat_final$max_depth[i] <- 18
+    quadrat_final$min_depth[i] <- 15
+  }
+  if (quadrat_final$depth[i] >= 18 & quadrat_final$depth[i] < 21){
+    quadrat_final$max_depth[i] <- 21
+    quadrat_final$min_depth[i] <- 18
+  }
+}
+
+# Reorder the columns to have survey_type, lat, and long at the beginning
+quadrat_final <- quadrat_final %>%
+  select(survey_type, survey_id, site, start_lat, start_lon, end_lat, end_lon, year, month, day, depth, min_depth, max_depth, substrate, everything(), -quadrat_count, -Key, -Method, -StartTime, -TransectNum, -QuadratNum)
+ 
+#write dataframe as a new file
+write.csv(quadrat_final, 
+          "./processed_data/DFO_surveys/dfo_quadrat_summary.csv", 
+          row.names = FALSE)
+
+
+#TRANSECT LEVEL SUMMARY ####
+#Each HKey is a unique transects 
+#Rename the columns in the dfo_count dataframe
+
+dfo_summary <- dfo_count %>%
+  rename(
+    rur_count = CountRSU,
+    pur_count = CountPSU,
+    gur_count = CountGSU
+  )
+
+#Add a column that counts the number of quadrats per transect (for area, and eventually density calculations)
+dfo_summary <- dfo_summary %>%
+  group_by(HKey) %>%
+  mutate(area = n()) %>%  # count number of quadrats per Key/Transect  
+  ungroup()
+
+# dd column that takes the mean, min and maximum depths for each Key/Transect 
+mean_depth_df <- dfo_summary %>%
+  group_by(HKey) %>%
+  summarise(depth = mean(ChartDepth, na.rm = TRUE),
+            min_depth = min(ChartDepth, na.rm = TRUE),
+            max_depth = max(ChartDepth, na.rm = TRUE),
+            .groups = 'drop')  # Drop grouping after summarizing
+
+#Add depth information to dfo_summary
+dfo_summary <- dfo_summary %>%
+  left_join(mean_depth_df, by = "HKey") %>%
+  select(-QuadratNum)
+
+#Summarize transect level total urchin counts, ensuring unique Keys
+transect_level_summary <- dfo_summary %>%
+  group_by(HKey) %>%
+  summarise(
+    total_gur = sum(gur_count, na.rm = TRUE),
+    total_pur = sum(pur_count, na.rm = TRUE),
+    total_rur = sum(rur_count, na.rm = TRUE),
+    area = first(area),  # Assuming quadrat_count is the same for each Key
+    .groups = 'drop'                        # Drop grouping after summarizing
+  ) %>%
+  # Add relative density and absolute density columns
+  mutate(
+    rd_gur = case_when(
+      total_gur == 0 ~ "None",
+      total_gur > 0 & total_gur <= 10 ~ "Few",
+      total_gur > 10 & total_gur <= 100 ~ "Many",
+      total_gur > 100 ~ "Abundant"
+    ),
+    rd_pur = case_when(
+      total_pur == 0 ~ "None",
+      total_pur > 0 & total_pur <= 10 ~ "Few",
+      total_pur > 10 & total_pur <= 100 ~ "Many",
+      total_pur > 100 ~ "Abundant"
+    ),
+    rd_rur = case_when(
+      total_rur == 0 ~ "None",
+      total_rur > 0 & total_rur <= 10 ~ "Few",
+      total_rur > 10 & total_rur <= 100 ~ "Many",
+      total_rur > 100 ~ "Abundant"
+    ),
+    # Add presence/absence columns
+    p_gur = ifelse(total_gur > 0, 1, 0),
+    p_pur = ifelse(total_pur > 0, 1, 0),
+    p_rur = ifelse(total_rur > 0, 1, 0),
+    # Calculate absolute density for each species
+    ad_gur = total_gur / area,  # Absolute density for green urchins
+    ad_pur = total_pur / area,  # Absolute density for purple urchins
+    ad_rur = total_rur / area   # Absolute density for red urchins
+  )
+
+#Join the transect-level relative density back to the main dataframe 
+transect_final <- transect_level_summary %>%
+  left_join(dfo_summary %>%
+              select(HKey, Method, SourceDB, Year, Month, Day, LatitudeStart, LongitudeStart, depth, min_depth, max_depth), 
+            by = "HKey")
+
+transect_final <- distinct(transect_final)
+
+# Survey type should be a combination of method and source database 
+transect_final <- transect_final %>%
+  mutate(survey_type = paste(SourceDB, Method, sep = "_"))
+
+
+# Rename columns
+transect_final <- transect_final %>%
+  rename(
+    start_lat = LatitudeStart,  # Assuming LatitudeStart should be in transect_final
+    start_lon = LongitudeStart, # Assuming LongitudeStart should be in transect_final
+    year = Year, 
+    month = Month, 
+    day = Day,
+    survey_id = HKey
+    
+  )
+
+#The metadata that nees to be added is substrate + end lat/lon 
+#we're going to first separate each survey type, add meta data, and then combine them at the end 
+#filter quadrat final for only methods GSU 
+transect_final_GSU <- transect_final %>% 
+  filter(SourceDB == "GSU")
+
+#now for only MSP
+transect_final_MSP <- transect_final %>% 
+  filter(SourceDB == "Multispecies")
+
+#now for only RSU 
+transect_final_RSU <- transect_final %>% 
+  filter(SourceDB == "RSU")
+
+#need to summarize substrate across surveys to map 
+#Summarize the most dominant SubSubCat for each transect (HKey) for GSU 
+dfo_GSU_sub <- dfo_GSU %>%
+  # Combine SubCat and SubSubCat into a single column 'substrate' for grouping
+  mutate(substrate = paste0(SubCat, SubSubCat)) %>%
+  group_by(HKey, year, month, day, LatStart, LonStart, LatEnd, LonEnd) %>%
+  count(substrate, sort = TRUE) %>%            # Count occurrences of each substrate combination within each HKey
+  slice_max(n, n = 1, with_ties = FALSE) %>%   # Keep the most frequent substrate
+  ungroup() %>%
+  # Rename substrate values as needed
+  mutate(
+    substrate = case_when(
+      substrate == "1a" ~ "Bedrock",
+      substrate == "1b" ~ "Boulder",
+      substrate == "2"  ~ "Mixed",
+      substrate == "3a" ~ "Sand",
+      substrate == "3b" ~ "Mud",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Select relevant columns
+  select(HKey, year, month, day, LatStart, LonStart, LatEnd, LonEnd, substrate)
+
+
+#Summarize the most dominant SubSubCat for each transect (HKey) for Msp 
+dfo_MSP_sub <- dfo_Msp %>%
+  #Combine SubCat and SubSubCat into a single column 'substrate' for grouping
+  mutate(substrate = paste0(SubCat, SubSubCat)) %>%
+  group_by(Key, year, month, day, latStart, lonStart, latEnd, lonEnd) %>%
+  count(substrate, sort = TRUE) %>%            # Count occurrences of each substrate combination within each HKey
+  slice_max(n, n = 1, with_ties = FALSE) %>%   # Keep the most frequent substrate
+  ungroup() %>%
+  #Rename substrate values as needed
+  mutate(
+    substrate = case_when(
+      substrate == "1a" ~ "Bedrock",
+      substrate == "1b" ~ "Boulder",
+      substrate == "2"  ~ "Mixed",
+      substrate == "3a" ~ "Sand",
+      substrate == "3b" ~ "Mud",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  #Select relevant columns
+  select(Key, year, month, day, latStart, lonStart, latEnd, lonEnd, substrate)
+
+
+#perform a left join to bring dfo_GSU data based on specified columns 
+transect_final_GSU_matched <- transect_final_GSU %>%
+  left_join(
+    dfo_GSU_sub %>%
+      select(LatStart, LonStart, year, LatEnd, LonEnd,  month, day, substrate, HKey) %>%
+      distinct(),
+    by = c("start_lat" = "LatStart", 
+           "start_lon" = "LonStart", 
+           "year" = "year", 
+           "month" = "month", 
+           "day" = "day", 
+           "survey_id"= "HKey")  #Ensure mapping is correct
+)
+
+#perform a left join to bring dfo_MSP data based on specified columns 
+transect_final_MSP_matched <- transect_final_MSP %>%
+  left_join(
+    dfo_MSP_sub %>%
+      select(latStart, lonStart, year, latEnd, lonEnd,  month, day, substrate) %>%
+      distinct(),
+    by = c("start_lat" = "latStart", 
+           "start_lon" = "lonStart", 
+           "year" = "year", 
+           "month" = "month", 
+           "day" = "day")  #Ensure mapping is correct
+)
+
+
+#rename columns to match end and start latitude 
+transect_final_GSU_matched <- transect_final_GSU_matched %>%
+  rename(
+    end_lat = LatEnd,
+    end_lon = LonEnd
+  )
+
+
+#rename columns to match end and start latitude 
+transect_final_MSP_matched <- transect_final_MSP_matched %>%
+  rename(
+    end_lat = latEnd,
+    end_lon = lonEnd
+  )
+
+
+#Now for RSU, which again we don't have data for 
+transect_final_RSU_matched <- transect_final_RSU %>%
+  mutate(
+    end_lat = NA,
+    end_lon = NA,
+    substrate = NA
+  )
+
+#transect final = 3935
+#now rbind them all back together, 3937 (two additional transects?)
+transect_final <- rbind(transect_final_RSU_matched, transect_final_GSU_matched, transect_final_MSP_matched)
+
+transect_final$site <- transect_final$survey_id
+
+# Reorder the columns to have survey_type, lat, and long at the beginning
+transect_final <- transect_final %>%
+  select(survey_type, survey_id, site, start_lat, start_lon, end_lat, end_lon, year, month, day, depth, min_depth, max_depth, substrate, everything(), -area, -Method, -SourceDB)
+
+
+#write dataframe as a new file
+write.csv(transect_final, 
+          "./processed_data/DFO_surveys/dfo_transect_summary.csv", 
+          row.names = FALSE)
+
+```
+
+#Relative density from DFO transects (includes MSp and BHM)
+```{r}
+#need to link metadata contained in dfo_BHM and dfo_Msp based on start latitude and start longitudes 
+
+#this is contained in the MERGED_TRANSECT_FILE 
+#information on start latitude and end longitude 
+#for BHM - this information can be linked via HKey 
+#for MSp - this information can be linked using Start/End (HKey is NOT a unique identifier)
+#note - BHMs data does not have any information about purple urchins 
+
+#Filter DFO transect data for only MSp and only BHM source 
+mps_transects <- dfo_transects[dfo_transects$Source == "MSp", ]
+bhm_transects <- dfo_transects[dfo_transects$Source == "BHM", ]
+
+
+#Benthic Habitat Mapping (BHM) pre-processing 
+#link bhm_transect to dfo_BHM by HKey
+bhm_transect_cleaned <- bhm_transects %>% #select only relevant columns 
+  select(-Transect, -Latitude, -Longitude, -RA_GDK, -RA_RSC, -RA_PYC, -RA_HRC, 
+         -RA_OSC, -RA_BRF, -RA_BRE, -RA_SPF, -RA_SPE, -RA_OCC, -RA_GPA, -RA_TDA)
+
+#Group and summarize dfo_BHM_cleaned by HKey
+dfo_BHM_summarized <- dfo_BHM %>%
+  group_by(HKey) %>%
+  summarise(
+    #Keep the first value for Lat/Lon since they are the same for each HKey
+    LatDegStart = first(LatDegStart),
+    LatMinStart = first(LatMinStart),
+    LonDegStart = first(LonDegStart),
+    LonMinStart = first(LonMinStart),
+    LatDegEnd = first(LatDegEnd),
+    LatMinEnd = first(LatMinEnd),
+    LonDegEnd = first(LonDegEnd),
+    LonMinEnd = first(LonMinEnd),
+    
+    #Find the most common category for SubCat and SubSubCat
+    DomSubCat = names(which.max(table(SubCat))),
+    DomSubSubCat = names(which.max(table(SubSubCat))),
+    
+    # Calculate depth summaries for quadrat
+    Min_Quad_Depth = min(CorDepthM, na.rm = TRUE),
+    Max_Quad_Depth = max(CorDepthM, na.rm = TRUE),
+    MeanDepth = mean(CorDepthM, na.rm = TRUE)
+  )
+
+#Left join the cleaned bhm_transect with the summarized dfo_BHM, same number of rows (1177)
+bhm_combined <- bhm_transect_cleaned %>%
+  left_join(dfo_BHM_summarized, by = "HKey")
+
+#Turn HKey into a character variable
+bhm_combined$HKey <- as.character(bhm_combined$HKey)
+
+#Calculate start and end latitudes into decimal degrees
+bhm_combined$Start_Lat <- bhm_combined$LatDegStart + (bhm_combined$LatMinStart/60)
+bhm_combined$Start_Long <- (bhm_combined$LonDegStart + (bhm_combined$LonMinStart/60))*(-1)
+bhm_combined$Shore_Lat <- bhm_combined$LatDegEnd + (bhm_combined$LatMinEnd/60)
+bhm_combined$Shore_Long <- (bhm_combined$LonDegEnd + (bhm_combined$LonMinEnd/60))*(-1)
+
+#Replace substrate category values with actual names for categories
+#filter out rows where there is no substrate data
+#this might change based on new substrate ENV layer 
+bhm_combined <- bhm_combined %>% filter(!is.na(DomSubCat)) #there are some NA but very few 
+#loop through each row of data and create a SubstrateCat column based on the DFO substrate key
+for (i in 1:length(bhm_combined$HKey)){
+  if (bhm_combined$DomSubCat[i] == 1){
+    if (bhm_combined$DomSubSubCat[i] == "a"){
+      bhm_combined$DomSubstrate_Cat[i] <- "Bedrock"
+    }
+    if (bhm_combined$DomSubSubCat[i] == "b"){
+      bhm_combined$DomSubstrate_Cat[i] <-"Boulder"
+    }
+  }
+  if (bhm_combined$DomSubCat[i] == 2){
+    bhm_combined$DomSubstrate_Cat[i] <-"Mixed"
+  }
+  if (bhm_combined$DomSubCat[i] == 3){
+    if (bhm_combined$DomSubSubCat[i] == "a"){
+      bhm_combined$DomSubstrate_Cat[i] <- "Sand"
+    }
+    if (bhm_combined$DomSubSubCat[i] == "b"){
+      bhm_combined$DomSubstrate_Cat[i] <- "Mud"
+    }
+  }
+}
+
+#Add a column for min and max depth (this is putting the records into pre-determined depth bins from the ROV dataset)
+#In the BHM dataset the depth for each quadrat represents the tide corrected depth at the end of the transect (shallowest point). 
+#Therefore records will be treated as if they were in the lower of two depth bins if on the edge of two
+#At the same time add BHM to the beginning of every HKey character
+#check the maximum and minimum depth of any record
+max(bhm_combined$MeanDepth) # it is 13.7 m
+min(bhm_combined$MeanDepth) # it is -2.6 m
+
+#filter out any record with no depth data 
+bhm_combined <- bhm_combined %>% filter(!is.na(MeanDepth))
+
+#loop through each row of the dataset and
+for (i in 1:length(bhm_combined$HKey)){
+  bhm_combined$HKey[i] <- paste0("BHM", bhm_combined$HKey[i])
+  if (bhm_combined$MeanDepth[i] >= -6 & bhm_combined$MeanDepth[i] < -3){
+    bhm_combined$Max_Depth[i] <- -3
+    bhm_combined$Min_Depth[i] <- -6
+  }
+  if (bhm_combined$MeanDepth[i] >= -3 & bhm_combined$MeanDepth[i] < 0){
+    bhm_combined$Max_Depth[i] <- 0
+    bhm_combined$Min_Depth[i] <- -3
+  }
+  if (bhm_combined$MeanDepth[i] >= 0 & bhm_combined$MeanDepth[i] < 3){
+    bhm_combined$Max_Depth[i] <- 3
+    bhm_combined$Min_Depth[i] <- 0
+  }
+  if (bhm_combined$MeanDepth[i] >= 3 & bhm_combined$MeanDepth[i] < 6){
+    bhm_combined$Max_Depth[i] <- 6
+    bhm_combined$Min_Depth[i] <- 3
+  }
+  if (bhm_combined$MeanDepth[i] >= 6 & bhm_combined$MeanDepth[i] < 9){
+    bhm_combined$Max_Depth[i] <- 9
+    bhm_combined$Min_Depth[i] <- 6
+  }
+  if (bhm_combined$MeanDepth[i] >= 9 & bhm_combined$MeanDepth[i] < 12){
+    bhm_combined$Max_Depth[i] <- 12
+    bhm_combined$Min_Depth[i] <- 9
+  }
+  if (bhm_combined$MeanDepth[i] >= 12 & bhm_combined$MeanDepth[i] < 15){
+    bhm_combined$Max_Depth[i] <- 15
+    bhm_combined$Min_Depth[i] <- 12
+  }
+  if (bhm_combined$MeanDepth[i] >= 15 & bhm_combined$MeanDepth[i] < 18){
+    bhm_combined$Max_Depth[i] <- 18
+    bhm_combined$Min_Depth[i] <- 15
+  }
+  if (bhm_combined$MeanDepth[i] >= 18 & bhm_combined$MeanDepth[i] < 21){
+    bhm_combined$Max_Depth[i] <- 21
+    bhm_combined$Min_Depth[i] <- 18
+  }
+}
+#Add a column for survey type
+bhm_combined$Survey_Type <- "DFO_BHM"
+
+#Select columns we want to include in the final dataset
+bhm_combined <- bhm_combined %>% dplyr::select(Survey_Type, HKey, Start_Lat, Start_Long, Shore_Lat, Shore_Long, Year, Month, Day, Max_Quad_Depth, Min_Quad_Depth, DomSubstrate_Cat,MeanDepth, Min_Depth, Max_Depth, RA_RSU, RA_GSU, RA_PSU)
+
+#Rename the columns in the bhm_combined dataset
+bhm_combined <- bhm_combined %>%
+  rename(
+    rd_rur = RA_RSU,
+    rd_pur = RA_PSU,
+    rd_gur = RA_GSU
+  )
+
+#Rename the categories in relative density columns 
+#Change the values in the columns rd_rur, rd_pur, and rd_gur
+bhm_combined <- bhm_combined %>%
+  mutate(
+    rd_rur = recode(rd_rur, 'N' = 'None', 'F' = 'Few', 'A' = 'Abundant', 'M' = 'Many'),
+    rd_pur = recode(rd_pur, 'N' = 'None', 'F' = 'Few', 'A' = 'Abundant', 'M' = 'Many'),
+    rd_gur = recode(rd_gur, 'N' = 'None', 'F' = 'Few', 'A' = 'Abundant', 'M' = 'Many')
+  )
+
+#Add columns for presence/absence for each species 
+bhm_combined <- bhm_combined %>%
+  mutate(
+    p_rur = ifelse(rd_rur == 'None', 0, 1),
+    p_pur = ifelse(rd_pur == 'None', 0, 1),
+    p_gur = ifelse(rd_gur == 'None', 0, 1)
+  )
+
+#Multi-species pre-processing 
+#dfo_Msp - quadrat data 
+#msp_transect - transect data 
+#need to be linked via Start Lat and Start Lon 
+
+mps_transect_cleaned <- mps_transects %>%
+  select(-Transect, -RA_GDK, -RA_RSC, -RA_PYC, -RA_HRC, 
+         -RA_OSC, -RA_BRF, -RA_BRE, -RA_SPF, -RA_SPE, -RA_OCC, -RA_GPA, -RA_TDA)
+
+#Make Year, Month, Day colummn for quad data
+#Ensure that Time is in Date-Time format
+dfo_Msp$Time <- as.POSIXct(dfo_Msp$Time, format="%Y-%m-%d %H:%M")
+
+# Create new Year, Month, and Day columns
+dfo_Msp$Year <- format(dfo_Msp$Time, "%Y")
+dfo_Msp$Month <- format(dfo_Msp$Time, "%m")
+dfo_Msp$Day <- format(dfo_Msp$Time, "%d")
+
+
+#Group and summarize dfo_MSP_cleaned by
+dfo_MSP_summarized <- dfo_Msp %>%
+  group_by(Key, Year, Month, Day) %>%
+  summarise(
+    # Keep the first value for Lat/Lon since they are the same for each Key
+    latStart = first(latStart),
+    lonStart = first(lonStart),
+    latEnd = first(latEnd),
+    lonEnd = first(lonEnd),
+
+    
+    #Find the most common category for SubCat and SubSubCat
+    DomSubCat = names(which.max(table(SubCat))),
+    DomSubSubCat = names(which.max(table(SubSubCat))),
+    
+    # Calculate depth summaries
+    Min_Quad_Depth = min(CorDepthM, na.rm = TRUE),
+    Max_Quad_Depth = max(CorDepthM, na.rm = TRUE),
+    MeanDepth = mean(CorDepthM, na.rm = TRUE)
+  )
+
+#Rename latStart and lonStart to match the transect data 
+dfo_MSP_summarized <- dfo_MSP_summarized %>%
+  rename(
+    Latitude = latStart,
+    Longitude = lonStart
+  )
+
+dfo_MSP_summarized$Year <- as.numeric(dfo_MSP_summarized$Year )
+dfo_MSP_summarized$Month <- as.numeric(dfo_MSP_summarized$Month )
+dfo_MSP_summarized$Day <- as.numeric(dfo_MSP_summarized$Day )
+
+#Left join the cleaned mps_transect with the summarized dfo_MSP, joined by year month day and start and end latitudes
+mps_combined <- mps_transect_cleaned %>%
+  left_join(dfo_MSP_summarized, by = c("Latitude", "Longitude", "Year", "Month", "Day")) 
+
+#Rename latStart and lonStart to match the transect data 
+mps_combined<- mps_combined %>%
+  rename(
+    latStart = Latitude ,
+    lonStart = Longitude 
+  )
+
+#Turn HKey into a character variable
+mps_combined$HKey <- as.character(mps_combined$HKey)
+
+#This is where we need to turn HKey into unqiue value based on lat, lon, year, month, day
+mps_combined <- mps_combined %>%
+  group_by(latStart, lonStart, Year, Month, Day) %>%
+  mutate(HKey = cur_group_id()) %>%  # Create a unique ID for each group
+  ungroup()  
+
+#Replace substrate category values with actual names for categories
+#filter out rows where there is no substrate data
+#this might change based on new substrate ENV layer ############################### edits needed 
+mps_combined <- mps_combined %>% filter(!is.na(DomSubCat))
+#loop through each row of data and create a Substrate)Cat column based on the DFO substrate key
+for (i in 1:length(mps_combined$HKey)){
+  if (mps_combined$DomSubCat[i] == 1){
+    if (mps_combined$DomSubSubCat[i] == "a"){
+      mps_combined$DomSubstrate_Cat[i] <- "Bedrock"
+    }
+    if (mps_combined$DomSubSubCat[i] == "b"){
+      mps_combined$DomSubstrate_Cat[i] <-"Boulder"
+    }
+  }
+  if (mps_combined$DomSubCat[i] == 2){
+    mps_combined$DomSubstrate_Cat[i] <-"Mixed"
+  }
+  if (mps_combined$DomSubCat[i] == 3){
+    if (mps_combined$DomSubSubCat[i] == "a"){
+      mps_combined$DomSubstrate_Cat[i] <- "Sand"
+    }
+    if (mps_combined$DomSubSubCat[i] == "b"){
+      mps_combined$DomSubstrate_Cat[i] <- "Mud"
+    }
+  }
+}
+
+#Add a column for min and max depth (this is putting the records into my pre-determined depth bins from the ROV dataset)
+#In the BHM dataset the depth for each quadrat represents the tide corrected depth at the end of the transect (shallowest point). 
+#Therefore records will be treated as if they were in the lower of two depth bins if on the edge of two
+#At the same time add BHM to the beginning of every HKey character
+#check the maximum and minimum depth of any record
+max(mps_combined$MeanDepth) # it is 10 m
+min(mps_combined$MeanDepth) # it is -1.68 m
+
+#filter out any record with no depth data 
+mps_combined <- mps_combined %>% filter(!is.na(MeanDepth))
+
+#loop through each row of the dataset and
+for (i in 1:length(mps_combined$HKey)){
+  mps_combined$HKey[i] <- paste0("MPS", mps_combined$HKey[i])
+  if (mps_combined$MeanDepth[i] >= -6 & mps_combined$MeanDepth[i] < -3){
+    mps_combined$Max_Depth[i] <- -3
+    mps_combined$Min_Depth[i] <- -6
+  }
+  if (mps_combined$MeanDepth[i] >= -3 & mps_combined$MeanDepth[i] < 0){
+    mps_combined$Max_Depth[i] <- 0
+    mps_combined$Min_Depth[i] <- -3
+  }
+  if (mps_combined$MeanDepth[i] >= 0 & mps_combined$MeanDepth[i] < 3){
+    mps_combined$Max_Depth[i] <- 3
+    mps_combined$Min_Depth[i] <- 0
+  }
+  if (mps_combined$MeanDepth[i] >= 3 & mps_combined$MeanDepth[i] < 6){
+    mps_combined$Max_Depth[i] <- 6
+    mps_combined$Min_Depth[i] <- 3
+  }
+  if (mps_combined$MeanDepth[i] >= 6 & mps_combined$MeanDepth[i] < 9){
+    mps_combined$Max_Depth[i] <- 9
+    mps_combined$Min_Depth[i] <- 6
+  }
+  if (mps_combined$MeanDepth[i] >= 9 & mps_combined$MeanDepth[i] < 12){
+    mps_combined$Max_Depth[i] <- 12
+    mps_combined$Min_Depth[i] <- 9
+  }
+  if (mps_combined$MeanDepth[i] >= 12 & mps_combined$MeanDepth[i] < 15){
+    mps_combined$Max_Depth[i] <- 15
+    mps_combined$Min_Depth[i] <- 12
+  }
+  if (mps_combined$MeanDepth[i] >= 15 & mps_combined$MeanDepth[i] < 18){
+    mps_combined$Max_Depth[i] <- 18
+    mps_combined$Min_Depth[i] <- 15
+  }
+  if (mps_combined$MeanDepth[i] >= 18 & mps_combined$MeanDepth[i] < 21){
+    mps_combined$Max_Depth[i] <- 21
+    mps_combined$Min_Depth[i] <- 18
+  }
+}
+#Add a column for survey type
+mps_combined$Survey_Type <- "DFO_MSP"
+
+#Select columns we want to include in the final dataset
+mps_combined <- mps_combined %>% dplyr::select(Survey_Type, HKey, latStart, lonStart, lonEnd, latEnd, Year, Month, Day, Max_Quad_Depth, Min_Quad_Depth, DomSubstrate_Cat,MeanDepth, Min_Depth, Max_Depth, RA_RSU, RA_GSU, RA_PSU)
+
+#Rename the columns in the bhm_combined dataset
+mps_combined <- mps_combined %>%
+  rename(
+    rd_rur = RA_RSU,
+    rd_pur = RA_PSU,
+    rd_gur = RA_GSU
+  )
+
+#Rename the categories in relative density columns 
+#Change the values in the columns rd_rur, rd_pur, and rd_gur
+mps_combined <- mps_combined %>%
+  mutate(
+    rd_rur = recode(rd_rur, 'N' = 'None', 'F' = 'Few', 'A' = 'Abundant', 'M' = 'Many'),
+    rd_pur = recode(rd_pur, 'N' = 'None', 'F' = 'Few', 'A' = 'Abundant', 'M' = 'Many'),
+    rd_gur = recode(rd_gur, 'N' = 'None', 'F' = 'Few', 'A' = 'Abundant', 'M' = 'Many')
+  )
+
+#Add columns for presence/absence for each species 
+mps_combined <- mps_combined %>%
+  mutate(
+    p_rur = ifelse(rd_rur == 'None', 0, 1),
+    p_pur = ifelse(rd_pur == 'None', 0, 1),
+    p_gur = ifelse(rd_gur == 'None', 0, 1)
+  )
+
+#Add columns 'counts' with NA values 
+#Add new columns with NA values to mps_combined and bhm_combined
+#Add new columns with NA values to mps_combined and bhm_combined
+mps_combined$gur_count <- NA
+mps_combined$rur_count <- NA
+mps_combined$pur_count <- NA
+mps_combined$ad_pur <- NA
+mps_combined$ad_gur <- NA
+mps_combined$ad_rur <- NA
+mps_combined$site <- mps_combined$HKey
+
+bhm_combined$gur_count <- NA
+bhm_combined$rur_count <- NA
+bhm_combined$pur_count <- NA
+bhm_combined$ad_pur <- NA
+bhm_combined$ad_gur <- NA
+bhm_combined$ad_rur <- NA
+bhm_combined$site <- bhm_combined$HKey
+
+#Rename columns in both dataframes
+mps_combined <- mps_combined %>%
+  rename(
+    survey_type = Survey_Type,
+    survey_id = HKey,
+    start_lat = latStart,
+    start_lon = lonStart,
+    end_lon = lonEnd,
+    end_lat = latEnd,
+    month = Month,
+    day = Day,
+    year = Year,
+    substrate = DomSubstrate_Cat,
+    depth = MeanDepth,
+    min_depth = Min_Depth,
+    max_depth = Max_Depth
+  )
+
+bhm_combined <- bhm_combined %>%
+  rename(
+    survey_type = Survey_Type,
+    survey_id = HKey,
+    start_lat = Start_Lat,
+    start_lon = Start_Long,
+    end_lon = Shore_Long,
+    end_lat = Shore_Lat,
+    month = Month,
+    day = Day,
+    year = Year,
+    substrate = DomSubstrate_Cat,
+    depth = MeanDepth,
+    min_depth = Min_Depth,
+    max_depth = Max_Depth
+  )
+
+#Remove the specified columns from both dataframes
+mps_combined <- mps_combined %>%
+  select(-Max_Quad_Depth, -Min_Quad_Depth)
+
+bhm_combined <- bhm_combined %>%
+  select(-Max_Quad_Depth, -Min_Quad_Depth)
+
+#COMBINE 
+
+dfo_relative_combined <- rbind(mps_combined, bhm_combined)
+
+#write dataframe as a new file
+write.csv(dfo_relative_combined, 
+          "./processed_data/DFO_surveys/dfo_relative_transect_summary.csv", 
+          row.names = FALSE)
+
+
+```
+
+#Combining all our external DATA 
+```{r}
+hakai <- read.csv( "./processed_data/Hakai/hakai_quadrat_summary.csv")
+RLS <- read.csv( "./processed_data/RLS/RLS_transect_summary.csv")
+DFO_count <- read.csv("./processed_data/DFO_surveys/dfo_quadrat_summary.csv")
+DFO_relative <- read.csv("./processed_data/DFO_surveys/dfo_relative_transect_summary.csv")
+
+
+combined_data <- rbind(hakai, RLS, DFO_count, DFO_relative)
+```
+
+#Now add in Baum lab ROV data
+```{r}
+#need to reformat this data to fit our other data types 
+
+rov_selected <- ROV_counts[, c("survey_type", "survey_id", "site", "start_lat", "start_lon", "end_lat", "end_lon", 
+                          "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "occurrence", "Abundance")]
+
+# Update the site column
+rov_selected <- rov_selected %>%
+  mutate(site = ifelse(site == "Leey’qsun_island", "Leey_island", site)) #special symbol causes issues later
+
+#remove all total records 
+rov_selected <- rov_selected[rov_selected$species != "TOT", ]
+
+#change PU = PUR, GU = GUR, and RU = RUR
+rov_selected <- rov_selected %>%
+  mutate(species = case_when(
+    species == "PU" ~ "PUR",
+    species == "GU" ~ "GUR",
+    species == "RU" ~ "RUR",
+    TRUE ~ species  # Retain other values
+  ))
+
+```
+
+#Creating present dataset for PUR, GUR, RUR
+#make data long
+```{r}
+# Select the columns you want to keep
+combined_presence <- combined_data %>%
+  select(survey_type, survey_id, site, start_lat, start_lon, end_lat, end_lon, 
+         year, month, day, depth, min_depth, max_depth, substrate, 
+         p_gur, p_rur, p_pur)
+
+# Pivot to long format
+long_presence <- combined_presence %>%
+  pivot_longer(cols = c(p_gur, p_rur, p_pur), 
+               names_to = "species", 
+               values_to = "occurrence", 
+               names_prefix = "p_") %>%
+  mutate(species = recode(species, gur = "GUR", rur = "RUR", pur = "PUR"))
+
+#select relevant columns from rov data 
+rov_selected1 <- rov_selected[, c("survey_type", "survey_id", "site", "start_lat", "start_lon", "end_lat", "end_lon", 
+                          "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "occurrence")]
+#bind 
+presence <- rbind(rov_selected1, long_presence)
+
+#Remove NA values in occurence column 
+presence <- presence %>%
+  filter(!is.na(occurrence))
+
+
+#save file of ALL (both absence and presence)
+write.csv(presence, 
+          "./processed_data/Survey_Datasets/presence_absence.csv", 
+          row.names = FALSE)
+
+
+#save file that is ONLY presence 
+presence_only <- presence[presence$occurrence == 1, ]
+
+write.csv(presence_only, 
+          "./processed_data/Survey_Datasets/presence_only.csv", 
+          row.names = FALSE)
+
+
+
+```
+
+#Creating count actual density datase for PUR, GUR, PUR 
+
+```{r}
+
+#Something we REALLY need to think about here is how we standardize actual density across datasets
+#Because the counts are divided by different areas. 
+#As it stands right now, we divide count/area (so they should all be within m^2 values)
+
+#Select the columns you want to keep
+combined_actual <- combined_data %>%
+  select(survey_type, survey_id, site, start_lat, start_lon, end_lat, end_lon, 
+         year, month, day, depth, min_depth, max_depth, substrate, 
+         ad_gur, ad_rur, ad_pur)
+
+#remove NA values in actual density 
+combined_actual <- combined_actual[complete.cases(combined_actual[, c("ad_gur", "ad_pur", "ad_rur")]), ]
+
+
+#Pivot to long format
+long_actual <- combined_actual %>%
+  pivot_longer(cols = c(ad_gur, ad_rur, ad_pur), 
+               names_to = "species", 
+               values_to = "density_m2", 
+               names_prefix = "ad_") %>%
+  mutate(species = recode(species, gur = "GUR", rur = "RUR", pur = "PUR"))
+
+#filter out NA values in occurence column 
+long_actual <- long_actual %>%
+  filter(!is.na(density_m2))
+
+write.csv(long_actual, 
+          "./processed_data/Survey_Datasets/actual_density.csv", 
+          row.names = FALSE)
+
+
+```
+
+#Creating relative density data for PUR, GUR, PUR 
+#this data only makes sense for ROV and DFO transects, the others are NOT comparable 
+
+```{r}
+
+#combine dfo_relative combine with baum ONLY 
+# Select the columns you want to keep
+dfo_relative_selected <- DFO_relative %>%
+  select(survey_type, survey_id, site, start_lat, start_lon, end_lat, end_lon, 
+         year, month, day, depth, min_depth, max_depth, substrate, 
+         rd_gur, rd_rur, rd_pur)
+
+#Pivot to long format
+long_relative <- dfo_relative_selected %>%
+  pivot_longer(cols = c(rd_gur, rd_rur, rd_pur), 
+               names_to = "species", 
+               values_to = "Abundance", 
+               names_prefix = "rd_") %>%
+  mutate(species = recode(species, gur = "GUR", rur = "RUR", pur = "PUR"))
+
+#select relevant columns from rov data 
+rov_selected2 <- rov_selected[, c("survey_type", "survey_id", "site", "start_lat", "start_lon", "end_lat", "end_lon", 
+                          "year", "month", "day", "depth", "min_depth", "max_depth", "substrate", "species", "Abundance")]
+
+
+#bind 
+relative <- rbind(rov_selected2, long_relative)
+
+#save
+write.csv(relative, 
+          "./processed_data/Survey_Datasets/relative_density.csv", 
+          row.names = FALSE)
+
+
+```
+

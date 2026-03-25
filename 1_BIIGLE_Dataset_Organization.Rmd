@@ -1,0 +1,392 @@
+---
+title: "BIIGLE_Dataset_Organization"
+author: "Caitlin Bergman, Bronwyn Hobson and Matt Csordas"
+edits: 'Tessa Rehill'
+date: "2023-10-23"
+output: 
+  html_document:
+  toc: yes
+  toc_depth: 3
+  toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load required packages
+```{r}
+library(tidyverse)
+library(readxl)
+library(terra)
+```
+
+# Combine all of the annotations into one single .csv file
+```{r}
+#Set working directory to be that containing the BIIGLE output
+setwd("./raw_data/Baum_ROV/BIIGLE_output")
+
+#Create a list of all .zip files in the directory
+filelist <- list.files(path = ".", pattern = ".zip") 
+
+#Read column headers into a dataframe, adding column for transect name
+file1 <- read.csv(unzip(filelist[1], exdir = "."))
+data <- file1[0,]%>%
+  add_column(transect_id = NA)
+
+#Unzip and read each file, and add the data to a single csv file
+for (k in 1:length(filelist)){
+  unzipped_file <- unzip(filelist[k], exdir=".") #Unzips file k
+  video_name <- unzipped_file%>%
+    {gsub("^.*?-","",.)}%>% #Changes formatting of volume name to give site name
+    {gsub("\\..*.","",.)}%>%
+    {gsub("-"," ",.)}%>%
+    str_to_title()
+  file <- read.csv(unzipped_file)%>% #Reads csv file
+    add_column(transect_id = video_name) #Adds column for file (transect) name
+  data <- rbind(data, file) #Adds data from current file into the overall data set
+}
+
+#Writing combined data into.csv file
+setwd("./raw_data/Baum_ROV/Processed_BIIGLE_data")
+
+write.csv(data, "./data.csv")
+
+#Read in the data dataframe
+data <- read.csv("./data.csv")
+```
+
+# Process the urchin data
+
+## Create a dataframe to input species presence/absence in each depth bin
+```{r}
+#Creating dataframe with a column for each transect and depth bin, and a row for each kelp species
+species_presence_by_video <- data %>%
+  select(transect_id,video_filename, label_name,label_hierarchy, frames)%>%
+  filter(grepl("Depth bin", label_hierarchy))
+species_presence_by_video$frames <-gsub("\\[","",gsub("\\]","",species_presence_by_video$frames))#Remove brackets from frame 
+species_presence_by_video[c("start_frame","mid_frame","end_frame")]<-as.numeric(str_split_fixed(species_presence_by_video$frames,",",n=3)) #Splits frame column into three numbers (start/mid/end). Look into methods to only take the start and end values.
+
+#loop to fix weird middle annotations
+for (i in 1:length(species_presence_by_video$mid_frame)){
+  if (is.na(species_presence_by_video$end_frame[i])){
+    species_presence_by_video$end_frame[i] = species_presence_by_video$mid_frame[i]
+  }
+}
+
+#Add column for each kelp species, with 0s for all species
+urchin_list<-c("No red urchins", "No green urchins", "No purple urchins", "1-10 green urchins", ">10 green urchins", "1-10 red urchins", ">10 red urchins", "1-10 purple urchins", ">10 purple urchins", ">10 total urchins")
+
+species_presence_by_video[urchin_list]<-0 
+```
+
+## Create a dataframe of all substrate categories along each transect
+```{r}
+#Filter data set for substrate class annotations
+substrate <- data %>% select(transect_id,video_filename, label_name,label_hierarchy, frames)%>%
+  filter(grepl("Substrate",label_hierarchy))
+#Remove brackets from the frames column
+substrate$frames <-gsub("\\[","",gsub("\\]","",substrate$frames))
+#split the frames column into three separate values 
+substrate[c("start_frame","mid_frame","end_frame")]<-as.numeric(str_split_fixed(substrate$frames,",",n=3)) 
+for (i in 1:nrow(substrate)){
+  if (is.na(substrate$end_frame[i])){
+    substrate$end_frame[i] <- substrate$mid_frame[i]
+  }
+}
+#remove NAs in frame columns 
+substrate <- substrate %>% filter(!is.na(start_frame)& !is.na(end_frame))
+#Add columns for each kelp species
+substrate[urchin_list] <- 0
+```
+
+## Create a dataframe containing all urchin annotations 
+```{r}
+urchin_annotation_data<-data%>%
+  select(transect_id,video_filename, label_name,label_hierarchy, frames, label_id)%>%
+  filter(label_id == "213861"|label_id == "213862"|label_id == "213863"|label_id == "213864"|label_id == "213865"|label_id == "213866"|label_id == "213867"|label_id == "213868"|label_id == "213869"|label_id == "214102")
+urchin_annotation_data$frames <-as.numeric(gsub("\\[","",gsub("\\]","",urchin_annotation_data$frames)))#Removes brackets from frame values
+urchin_annotation_data <- urchin_annotation_data %>% filter(!is.na(frames))
+urchin_annotation_data <- urchin_annotation_data %>%
+  select(-label_id)  # Remove the label_id column
+```
+
+
+## Add presence/absence information for each species to the depth bin dataframe
+```{r}
+for (depth in 1:length(species_presence_by_video$transect_id)){ #Loops through list of all depth bin annotations
+  annotations <- urchin_annotation_data%>% 
+    filter(video_filename==species_presence_by_video$video_filename[depth]) #Lists all kelp annotations within the selected video
+  for(urchin in 1:length(annotations$transect_id)){ 
+    if (length(annotations$transect_id)>=1){ #Checks if there are any annotations for that transect
+      if (!is.na(annotations$frames[urchin]) &
+        species_presence_by_video$start_frame[depth]<annotations$frames[urchin] &
+        annotations$frames[urchin]<species_presence_by_video$end_frame[depth]){  #Evaluates if each annotation from the video is in the selected depth bin. If it is, the number in the column for that species is changed from 0 to 1
+        species_index <- match(annotations$label_name[urchin], colnames(species_presence_by_video))
+        
+        species_presence_by_video[depth,species_index]<-1
+      } 
+    }
+  }
+}
+```
+
+## Add presence/absence information for each species to the substrate class dataframe
+```{r}
+#Loops through list of all substrate class annotations
+for (j in 1:length(substrate$transect_id)){
+  #Lists all kelp annotations within the selected video
+  annotations <- urchin_annotation_data%>% 
+    filter(video_filename==substrate$video_filename[j])
+  #Looks through all kelp annotations for the selected video
+  for(k in 1:length(annotations$transect_id)){ 
+    #Checks if there are any annotations for that transect
+    if (length(annotations$transect_id)>=1){
+      #Evaluates if each annotation from the video is in the selected substrate class. If it is, the number in the  column for that species is changed from 0 to 1
+      if (substrate$start_frame[j]<=annotations$frames[k] &
+        substrate$end_frame[j] >= annotations$frames[k]){
+          annotations$label_name[k]
+          species_index <- match(annotations$label_name[k], colnames(substrate))
+        
+          substrate[j,species_index]<-1
+       } 
+    }
+  }
+}
+```
+
+## Associate each urchin record with a depth bin and substrate class
+  #maybe the error here is because the depth in the annotatio_data frame is not numeric (but binned depth? )
+```{r}
+
+#Remove filename that is causing error 
+# Remove rows where video_filename is 'Desolation_Parks_94_forward_2_subs.mp4'
+urchin_annotation_data <- urchin_annotation_data %>%
+  filter(video_filename != "Desolation_Parks_94_forward_2_subs.mp4")
+
+#Loop through all of the kelp records
+for (i in 1:length(urchin_annotation_data$transect_id)){
+  #for each record pull all depth bins and substrate classes associated with the video name
+  depth <- species_presence_by_video %>% dplyr::select(-urchin_list)
+  depth <- depth %>% filter(video_filename == urchin_annotation_data$video_filename[i])
+  subs <- substrate %>% dplyr::select(-urchin_list) 
+  subs <- subs %>% filter(video_filename == urchin_annotation_data$video_filename[i])
+  #loop through each depth and substrate bin to see which the record is in and associate the appropriate depths and substrate class to the record
+  for (j in 1:length(depth$transect_id)){
+    if (depth$start_frame[j] <= urchin_annotation_data$frames[i] & depth$end_frame[j] >= urchin_annotation_data$frames[i]){
+      urchin_annotation_data$Depth[i] <- depth$label_name[j]
+    }
+  }
+  for (k in 1:length(subs$transect_id)){
+    if (subs$start_frame[k] <= urchin_annotation_data$frames[i] & subs$end_frame[k] >= urchin_annotation_data$frames[i]){
+      urchin_annotation_data$Substrate_Cat[i] <- subs$label_name[k]
+    }
+  }
+}
+
+
+```
+
+```{r}
+#Split the data in the depth column into a maximum and minimum depth
+#Figure out how many characters to take for each max depth
+charsize <- rep(1,length(urchin_annotation_data$Depth))
+for (i in 1: length(urchin_annotation_data$Depth)){
+  if (nchar(urchin_annotation_data$Depth[i])>4){
+    charsize[i] <- 2
+  }
+  #Make a column for max depth of the depth bin
+urchin_annotation_data$Max_Depth[i] <- substr(urchin_annotation_data$Depth[i], nchar(urchin_annotation_data$Depth[i])-charsize[i], nchar(urchin_annotation_data$Depth[i])-1)
+}
+#Make max depth numeric
+urchin_annotation_data$Max_Depth <- as.numeric(urchin_annotation_data$Max_Depth)
+#make a column for min depth
+urchin_annotation_data$Min_Depth <- urchin_annotation_data$Max_Depth - 3
+
+#Turn substrate class into a factor variable 
+urchin_annotation_data$Substrate_Cat <- as.factor(urchin_annotation_data$Substrate_Cat)
+```
+
+## Organize depth and substrate associated records into a final dataframe
+```{r}
+#Select the columns I want to keep
+urchin_records <- urchin_annotation_data %>% select(transect_id, label_name, Max_Depth, Min_Depth, Substrate_Cat)
+#rename the columns 
+colnames(urchin_records) <- c("Transect", "Label", "Max_Depth", "Min_Depth", "Substrate_Cat")
+#add a column to distringuish these records as being from my ROV surveys
+urchin_records$Survey_Type <- "Baum_ROV"
+```
+
+## Summarize urchin occurrence by transect and depth bin using the depth bin associated wide form records from above
+```{r}
+#pivot depth associated records longer to summarize occurrences within the same transect and depth bin by species
+species_presence_by_transect <- species_presence_by_video%>%
+  pivot_longer(cols=all_of(urchin_list),
+                    names_to='species',
+                    values_to='presence')%>%
+  group_by(transect_id,label_name, species)%>%
+   summarize(total_presence=sum(presence))
+  
+  for (i in 1:length(species_presence_by_transect$transect_id)){
+    if (species_presence_by_transect$total_presence[i]>1){
+      species_presence_by_transect$total_presence[i]<-1
+    }
+  }
+    
+  species_presence_by_transect<-species_presence_by_transect%>%
+    pivot_wider(names_from = species, values_from = total_presence)
+  
+#Rename columns for depth and transect ID
+colnames(species_presence_by_transect) <- c("Transect","Depth","Few_GU", "Few_PU","Few_RU", "Many_GU", "Many_PU", "Many_RU","Many_total","None_GU","None_PU","None_RU")
+
+#Figure out how many characters to take for each max depth
+charnum <- rep(1,length(species_presence_by_transect$Depth))
+for (i in 1: length(species_presence_by_transect$Depth)){
+  if (nchar(species_presence_by_transect$Depth[i])>4){
+    charnum[i] <- 2
+  }
+  #Make a column for max depth of the depth bin
+species_presence_by_transect$Max_Depth[i] <- substr(species_presence_by_transect$Depth[i], nchar(species_presence_by_transect$Depth[i])-charnum[i], nchar(species_presence_by_transect$Depth[i])-1)
+}
+#Make max depth numeric
+species_presence_by_transect$Max_Depth <- as.numeric(species_presence_by_transect$Max_Depth)
+#make a column for min depth
+species_presence_by_transect$Min_Depth <- species_presence_by_transect$Max_Depth - 3
+
+#Load the metadata spreadsheet 
+Metadata <- read.csv("./raw_data/metadata/transect_summary.csv")
+
+#Combine with metadata
+DepthTransect <-merge(species_presence_by_transect, Metadata, by.x = "Transect")
+
+TransectSum <- DepthTransect %>% select(Site, Transect, Start_Lat, Start_Long, Shore_Lat, Shore_Long, Shore_Bearing, Year, Month, Day, Max_Depth, Min_Depth, Few_GU, Few_PU, Few_RU, Many_GU, Many_PU, Many_RU, Many_total, None_GU ,None_PU, None_RU)
+
+Species_by_transect <- TransectSum %>% dplyr::select(Transect, Few_GU, Few_PU, Few_RU, Many_GU, Many_PU, Many_RU, Many_total, None_GU, None_PU, None_RU) %>% group_by(Transect) %>% summarise(across(everything(), list(max)))
+
+#Writing combined data into.csv file
+write.csv(TransectSum, 
+          "./processed_data/Baum_ROV/species_by_Transect_Depth.csv", 
+          row.names = FALSE)
+
+```
+
+## Combine the transect metadata with the individual depth and substrated associsted urchin occurence records 
+```{r}
+#Load the metadata spreadsheet 
+Metadata <- read.csv("./raw_data/metadata/transect_summary.csv")
+
+#Combine the metadata sheet with the substrate category and depth associated kelp records
+Urchin_Baum <- merge(urchin_records, Metadata, by.x = "Transect")
+#Finalize this dataframe
+Urchin_Baum <- Urchin_Baum %>% select(Survey_Type, Site, Transect, Start_Lat, Start_Long, Shore_Lat, Shore_Long, Shore_Bearing, Year, Month, Day, Label, Max_Depth, Min_Depth, Substrate_Cat)
+
+#Writing combined data into.csv file
+write.csv(Urchin_Baum , 
+          "./processed_data/Baum_ROV/Baum_ROV_Urchin_Records.csv", 
+          row.names = FALSE)
+
+```
+
+#Create a rov - urchin dataset 
+# one column for species, one column for density (0 = none, 1 = few, 2 = many, 3 = abundant)
+
+```{r}
+Urchin_Baum <- Urchin_Baum %>%
+  mutate(
+    Species = case_when(
+      grepl("purple", Label, ignore.case = TRUE) ~ "PU",
+      grepl("green", Label, ignore.case = TRUE) ~ "GU",
+      grepl("red", Label, ignore.case = TRUE) ~ "RU",
+      grepl("total", Label, ignore.case = TRUE) ~ "TOT",
+      TRUE ~ NA_character_  # In case there are unexpected labels
+    ),
+    Abundance = case_when(
+      grepl("no", Label, ignore.case = TRUE) ~ "None",
+      grepl("1-10", Label, ignore.case = TRUE) ~ "Few",
+      grepl(">10", Label, ignore.case = TRUE) ~ "Many",
+      TRUE ~ NA_character_  # Handles unexpected labels
+    )
+  )
+
+```
+
+#Fix 'many' category into 'abundant' based on urchin counts 
+
+```{r}
+#Load the 2022 ROV count data
+count_2022 <- read.csv("./raw_data/Baum_ROV/2022_ROV_urchin_count.csv") #from manual counts 
+
+# Add a Year column to count_2022
+count_2022 <- count_2022 %>%
+  mutate(Year = 2022)
+
+#Load the 2023 ROV count data
+count_2023 <- read.csv("./raw_data/Baum_ROV/2023_ROV_urchin_count.csv")
+
+data_2022 <- count_2022 %>%
+  select(Transect, Year, Red_urchin_count, Green_urchin_count, Purple_urchin_count, Overall_urchin_count)
+
+# Add a Year column to count_2022
+count_2023 <- count_2023 %>%
+  mutate(Year = 2023)
+
+# Combine 'site' and 'Transect.Number' into a new column 'Transect'
+count_2023 <- count_2023 %>%
+  mutate(Transect = paste(Site, Transect.Number, sep = " "))
+
+data_2023 <- count_2023 %>%
+  select(Transect, Year, Red_urchin_count, Green_urchin_count, Purple_urchin_count, Overall_urchin_count)
+
+count_data <- rbind(data_2022, data_2023)
+
+# Merge Urchin_Baum with count_data based on 'Year' and 'Transect', if urchin count > 100, change to abundant 
+urchin_baum_abundance <- Urchin_Baum %>%
+  left_join(count_data, by = c( "Transect", "Year")) %>%
+  mutate(
+    Abundance = case_when(
+      Species == "RU" & Red_urchin_count > 100 ~ "Abundant",   # Update for red urchins
+      Species == "GU" & Green_urchin_count > 100 ~ "Abundant", # Update for green urchins
+      Species == "PU" & Purple_urchin_count > 100 ~ "Abundant", # Update for purple urchins
+      Species == "TOT" & Overall_urchin_count > 100 ~ "Abundant", # Update for total urchins
+      TRUE ~ Abundance  # Keep the existing value if the condition is not met
+    )
+  )
+
+#there is NO count data for 2020 - hence the NA values 
+
+#Fix column names 
+# Rename columns in the urchin_baum_abundance dataframe
+urchin_baum_abundance <- urchin_baum_abundance %>%
+  rename(
+    survey_type = Survey_Type, 
+    survey_id = Transect,
+    site = Site,
+    start_lat = Start_Lat,
+    start_lon = Start_Long,
+    end_lat = Shore_Lat,
+    end_lon = Shore_Long,
+    substrate = Substrate_Cat,
+    year = Year,
+    month = Month,
+    day = Day,
+    rur_count = Red_urchin_count,
+    pur_count = Purple_urchin_count,
+    gur_count = Green_urchin_count, 
+    min_depth = Min_Depth, 
+    max_depth = Max_Depth, 
+    species = Species 
+  )
+
+#Add mean depth (depth = mean(min_depth + max_depth))
+urchin_baum_abundance$depth <- rowMeans(urchin_baum_abundance[, c("min_depth", "max_depth")], na.rm = TRUE)
+
+#add occurence column 
+urchin_baum_abundance$occurrence <- ifelse(urchin_baum_abundance$Abundance == "None", 0, 1)
+
+
+#Writing combined data into.csv file
+write.csv(urchin_baum_abundance , 
+          "./processed_data/Baum_ROV/Baum_ROV_Urchin_Counts.csv", 
+          row.names = FALSE)
+```
+

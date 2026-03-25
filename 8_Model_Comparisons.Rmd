@@ -1,0 +1,410 @@
+---
+title: "Model_comparisons"
+author: "Tessa Rehill"
+date: "2025-05-13"
+output: html_document
+---
+
+#comparing model outputs between occurrence, and count models 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#load packages
+
+```{r}
+  library(terra)
+  library(sf)
+  library(dplyr)
+  library(ggplot2)
+  library(cowplot)
+  library(ggspatial)
+  library(sf)
+  library(tibble)
+  library(knitr)
+  library(kableExtra)
+  library(patchwork)
+
+
+```
+
+#load data 
+```{r}
+#presence predictions
+GUR_LO_Raster <- rast("./processed_data/LO_Predictions/GUR_LO_Predictions.tif")
+RUR_LO_Raster <- rast("./processed_data/LO_Predictions/RUR_LO_Predictions.tif")
+PUR_LO_Raster <- rast("./processed_data/LO_Predictions/PUR_LO_Predictions.tif")
+
+#count predictions
+GUR_Count_Raster <- rast("./models_biomod/count/GUR/proj_GUR_current_count_ensembles/proj_GUR_current_count_ensembles_GUR_ensemble.tif")
+RUR_Count_Raster <- rast("./models_biomod/count/RUR/proj_RUR_current_count_ensembles/proj_RUR_current_count_ensembles_RUR_ensemble.tif")
+
+#masks (extrapolated variables)
+GURclamp <- rast("./models_biomod/count/GUR/proj_GUR_current_count/proj_GUR_current_count_ClampingMask.tif")
+RURclamp <- rast("./models_biomod/count/RUR/proj_RUR_current_count/proj_RUR_current_count_ClampingMask.tif")
+
+#Remove cells that extrapolate
+#GUR_Count_Raster <- mask(GUR_Count_Raster, GURclamp >= 1, maskvalue = TRUE)
+#RUR_Count_Raster <- mask(RUR_Count_Raster, RURclamp >= 1, maskvalue = TRUE)
+
+
+#predictions
+#PUR_Ordinal_Raster <- rast("./models_biomod/ordinal/PUR/PUR/proj_PUR_current_ord_ensembles/proj_PUR_current_ord_ensembles_PUR_ensemble.tif")
+RUR_Ordinal_Raster <- rast("./models_biomod/ordinal/RUR/proj_RUR_current_ord_ensembles/proj_RUR_current_ord_ensembles_RUR_ensemble.tif")
+GUR_Ordinal_Raster <- rast("./models_biomod/ordinal/GUR/proj_GUR_current_ord_ensembles/proj_GUR_current_ord_ensembles_GUR_ensemble.tif")
+
+#masks (extrapolated variables)
+#GURclamp <- rast("./models_biomod/ordinal/GUR/GUR/proj_GUR_current_ord/proj_GUR_current_ord_ClampingMask.tif")
+#RURclamp <- rast("./models_biomod/ordinal/RUR/RUR/proj_RUR_current_ord/proj_RUR_current_ord_ClampingMask.tif")
+#PURclamp <- rast("./models_biomod/ordinal/PUR/PUR/proj_PUR_current_ord/proj_PUR_current_ord_ClampingMask.tif")
+
+
+#Remove cells that extrapolate
+#GUR_Ordinal_Raster <- mask(GUR_Ordinal_Raster, GURclamp >= 1, maskvalue = TRUE)
+#RUR_Ordinal_Raster <- mask(RUR_Ordinal_Raster, RURclamp >= 1, maskvalue = TRUE)
+#PUR_Ordinal_Raster <- mask(PUR_Ordinal_Raster, PURclamp >= 1, maskvalue = TRUE)
+
+
+#geographic layers
+Land <- terra::vect("./raw_data/BC_Buffer/Land.shp") 
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+
+```
+
+
+#Comparing likelihood of occurrence to count predictions ####
+#Method: Spearmans correlation coefficient
+##Green urchin
+```{r}
+
+# --- RASTER ALIGNMENT ---
+GUR_LO_Raster <- resample(GUR_LO_Raster, GUR_Count_Raster, method = "bilinear")  # Match resolution
+
+# --- STACK AND PREP DATA ---
+stacked <- c(GUR_Count_Raster, GUR_LO_Raster)
+names(stacked) <- c("count", "likelihood")
+
+vals_df <- as.data.frame(stacked, na.rm = TRUE)
+
+# --- CHECK ASSUMPTIONS ---
+
+#Check normality - not normal 
+qqnorm(vals_df$count)
+qqline(vals_df$count, col = "blue")
+
+qqnorm(vals_df$likelihood)
+qqline(vals_df$likelihood, col = "red")
+
+
+#Check monotonicity 
+ggplot(vals_df, aes(x = likelihood, y = count)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "gam", formula = y ~ s(x), color = "blue", se = FALSE) +
+  theme_minimal() +
+  labs(title = "Check for monotonicity between count and likelihood",
+       x = "Likelihood of Occurrence",
+       y = "Urchin Count")
+
+
+# 2. Check for excessive ties (count data tends to be rounded or integer-valued)
+summary(as.factor(vals_df$count))  # Optional: assess frequency of repeated values
+length(unique(vals_df$count))      # Fewer unique values = more ties (Spearman can tolerate some)
+
+# 3. Independence assumption: Visual inspection (no autocorrelation check here, just note)
+# If you're concerned about spatial autocorrelation, Moran's I is an option 
+
+# --- RUN SPEARMAN'S RANK CORRELATION TEST ---
+spearman_result <- cor.test(vals_df$count, vals_df$likelihood, method = "spearman")
+print(spearman_result)
+
+GUR_LOC_v_count <- spearman_result
+
+GUR_LOC_v_count
+
+```
+
+#Red urchin
+```{r}
+# --- RASTER ALIGNMENT ---
+RUR_LO_Raster <- resample(RUR_LO_Raster, RUR_Count_Raster, method = "bilinear")  # Match resolution
+
+# --- STACK AND PREP DATA ---
+stacked <- c(RUR_Count_Raster, RUR_LO_Raster)
+names(stacked) <- c("count", "likelihood")
+
+vals_df <- as.data.frame(stacked, na.rm = TRUE)
+
+# --- CHECK ASSUMPTIONS ---
+#Check normality - not normal 
+qqnorm(vals_df$count)
+qqline(vals_df$count, col = "blue")
+
+qqnorm(vals_df$likelihood)
+qqline(vals_df$likelihood, col = "red")
+
+
+ggplot(vals_df, aes(x = likelihood, y = count)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "gam", formula = y ~ s(x), color = "blue", se = FALSE) +
+  theme_minimal() +
+  labs(title = "Check for monotonicity between count and likelihood",
+       x = "Likelihood of Occurrence",
+       y = "Urchin Count")
+
+
+# 2. Check for excessive ties (count data tends to be rounded or integer-valued)
+summary(as.factor(vals_df$count))  # Optional: assess frequency of repeated values
+length(unique(vals_df$count))      # Fewer unique values = more ties (Spearman can tolerate some)
+
+# 3. Independence assumption: Visual inspection (no autocorrelation check here, just note)
+# If you're concerned about spatial autocorrelation, Moran's I is an option 
+
+# --- RUN SPEARMAN'S RANK CORRELATION TEST ---
+spearman_result <- cor.test(vals_df$count, vals_df$likelihood, method = "spearman")
+print(spearman_result)
+
+RUR_LOC_v_count <- spearman_result
+
+
+```
+
+#Comparing count to relative abundance prediction ####
+##Green urchin 
+```{r}
+# --- RASTER ALIGNMENT ---
+GUR_Count_Raster <- resample(GUR_Count_Raster, GUR_Ordinal_Raster, method = "bilinear")  # Match resolution
+
+# --- STACK AND PREP DATA ---
+stacked <- c(GUR_Count_Raster, GUR_Ordinal_Raster)
+names(stacked) <- c("count", "density")
+
+vals_df <- as.data.frame(stacked, na.rm = TRUE)
+
+# --- CHECK ASSUMPTIONS ---
+#Check normality - not normal 
+qqnorm(vals_df$count)
+qqline(vals_df$count, col = "blue")
+
+qqnorm(vals_df$density)
+qqline(vals_df$density, col = "red")
+
+#Check monotonicity
+ggplot(vals_df, aes(x = density, y = count)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "gam", formula = y ~ s(x), color = "blue", se = FALSE) +
+  theme_minimal() +
+  labs(title = "Check for monotonicity between count and relative density",
+       x = "Relative Density",
+       y = "Urchin Count")
+
+
+# 2. Check for excessive ties (count data tends to be rounded or integer-valued)
+summary(as.factor(vals_df$count))  # Optional: assess frequency of repeated values
+length(unique(vals_df$count))      # Fewer unique values = more ties (Spearman can tolerate some)
+
+summary(as.factor(vals_df$density))  
+length(unique(vals_df$density))   
+
+# 3. Independence assumption: Visual inspection (no autocorrelation check here, just note)
+# If you're concerned about spatial autocorrelation, Moran's I is an option 
+
+# --- RUN SPEARMAN'S RANK CORRELATION TEST ---
+spearman_result <- cor.test(vals_df$count, vals_df$density, method = "spearman")
+print(spearman_result)
+
+GUR_RA_v_count <- spearman_result
+
+
+```
+
+##Red urchin 
+```{r}
+# --- RASTER ALIGNMENT ---
+RUR_Count_Raster <- resample(RUR_Count_Raster, RUR_Ordinal_Raster, method = "bilinear")  # Match resolution
+
+# --- STACK AND PREP DATA ---
+stacked <- c(RUR_Count_Raster, RUR_Ordinal_Raster)
+names(stacked) <- c("count", "density")
+
+vals_df <- as.data.frame(stacked, na.rm = TRUE)
+
+# --- CHECK ASSUMPTIONS ---
+
+qqnorm(vals_df$count)
+qqline(vals_df$count, col = "blue")
+
+qqnorm(vals_df$density)
+qqline(vals_df$density, col = "red")
+
+ggplot(vals_df, aes(x = density, y = count)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "gam", formula = y ~ s(x), color = "blue", se = FALSE) +
+  theme_minimal() +
+  labs(title = "Check for monotonicity between count and relative density",
+       x = "Relative Density",
+       y = "Urchin Count")
+
+
+# 2. Check for excessive ties (count data tends to be rounded or integer-valued)
+summary(as.factor(vals_df$count))  # Optional: assess frequency of repeated values
+length(unique(vals_df$count))      # Fewer unique values = more ties (Spearman can tolerate some)
+
+summary(as.factor(vals_df$density))  
+length(unique(vals_df$density))   
+
+# 3. Independence assumption: Visual inspection (no autocorrelation check here, just note)
+# If you're concerned about spatial autocorrelation, Moran's I is an option 
+
+# --- RUN SPEARMAN'S RANK CORRELATION TEST ---
+spearman_result <- cor.test(vals_df$count, vals_df$density, method = "spearman")
+print(spearman_result)
+
+RUR_RA_v_count <- spearman_result
+
+```
+
+
+#Comparing likelihood of occurrence to relative abundance prediction ####
+#Green urchin 
+```{r}
+# --- RASTER ALIGNMENT ---
+GUR_Ordinal_Raster <- resample(GUR_Ordinal_Raster, GUR_LO_Raster,  method = "bilinear")  # Match resolution
+
+# --- STACK AND PREP DATA ---
+stacked <- c(GUR_LO_Raster, GUR_Ordinal_Raster)
+names(stacked) <- c("occurrence", "density")
+
+vals_df <- as.data.frame(stacked, na.rm = TRUE)
+
+# --- CHECK ASSUMPTIONS ---
+qqnorm(vals_df$occurrence)
+qqline(vals_df$occurrence, col = "blue")
+
+qqnorm(vals_df$density)
+qqline(vals_df$density, col = "red")
+
+
+ggplot(vals_df, aes(x = density, y = occurrence)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "gam", formula = y ~ s(x), color = "blue", se = FALSE) +
+  theme_minimal() +
+  labs(title = "Check for monotonicity between occurrence and relative density",
+       x = "Relative Density",
+       y = "Urchin LOC")
+
+
+# 2. Check for excessive ties (count data tends to be rounded or integer-valued)
+summary(as.factor(vals_df$occurrence))  # Optional: assess frequency of repeated values
+length(unique(vals_df$occurrence))      # Fewer unique values = more ties (Spearman can tolerate some)
+
+summary(as.factor(vals_df$density))  
+length(unique(vals_df$density))   
+
+# 3. Independence assumption: Visual inspection (no autocorrelation check here, just note)
+# If you're concerned about spatial autocorrelation, Moran's I is an option 
+
+# --- RUN SPEARMAN'S RANK CORRELATION TEST ---
+spearman_result <- cor.test(vals_df$occurrence, vals_df$density, method = "spearman")
+print(spearman_result)
+
+GUR_RA_v_LOC <- spearman_result
+```
+
+#Red urchin 
+```{r}
+# --- RASTER ALIGNMENT ---
+RUR_Ordinal_Raster <- resample(RUR_Ordinal_Raster, RUR_LO_Raster, method = "bilinear")  # Match resolution
+
+# --- STACK AND PREP DATA ---
+stacked <- c(RUR_LO_Raster, RUR_Ordinal_Raster)
+names(stacked) <- c("occurrence", "density")
+
+vals_df <- as.data.frame(stacked, na.rm = TRUE)
+
+# --- CHECK ASSUMPTIONS ---
+qqnorm(vals_df$occurrence)
+qqline(vals_df$occurrence, col = "blue")
+
+qqnorm(vals_df$density)
+qqline(vals_df$density, col = "red")
+
+ggplot(vals_df, aes(x = density, y = occurrence)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "gam", formula = y ~ s(x), color = "blue", se = FALSE) +
+  theme_minimal() +
+  labs(title = "Check for monotonicity between occurrence and relative density",
+       x = "Relative Density",
+       y = "Urchin LOC")
+
+
+# 2. Check for excessive ties (count data tends to be rounded or integer-valued)
+summary(as.factor(vals_df$occurrence))  # Optional: assess frequency of repeated values
+length(unique(vals_df$occurrence))      # Fewer unique values = more ties (Spearman can tolerate some)
+
+summary(as.factor(vals_df$density))  
+length(unique(vals_df$density))   
+
+# 3. Independence assumption: Visual inspection (no autocorrelation check here, just note)
+# If you're concerned about spatial autocorrelation, Moran's I is an option 
+
+# --- RUN SPEARMAN'S RANK CORRELATION TEST ---
+spearman_result <- cor.test(vals_df$occurrence, vals_df$density, method = "spearman")
+print(spearman_result)
+
+RUR_RA_v_LOC <- spearman_result
+```
+
+
+
+```{r}
+# Create a summary table of Spearman correlation test results
+
+summary_table <- tibble(
+  Species = c("Green Urchin", "Red Urchin"),
+  
+  `LOC vs Count (rho)` = c(
+    round(GUR_LOC_v_count$estimate, 3),
+    round(RUR_LOC_v_count$estimate, 3)
+  ),
+  `LOC vs Count (p-value)` = c(
+    format.pval(GUR_LOC_v_count$p.value, digits = 3),
+    format.pval(RUR_LOC_v_count$p.value, digits = 3)
+  ),
+  
+  `Count vs RA (rho)` = c(
+    round(GUR_RA_v_count$estimate, 3),
+    round(RUR_RA_v_count$estimate, 3)
+  ),
+  `Count vs RA (p-value)` = c(
+    format.pval(GUR_RA_v_count$p.value, digits = 3),
+    format.pval(RUR_RA_v_count$p.value, digits = 3)
+  ),
+  
+  `LOC vs RA (rho)` = c(
+    round(GUR_RA_v_LOC$estimate, 3),
+    round(RUR_RA_v_LOC$estimate, 3)
+  ),
+  `LOC vs RA (p-value)` = c(
+    format.pval(GUR_RA_v_LOC$p.value, digits = 3),
+    format.pval(RUR_RA_v_LOC$p.value, digits = 3)
+  )
+)
+
+summary_table %>% 
+  kable("html", caption = "Spearman Correlations Among Models by Urchin Species") %>% 
+  kable_styling(full_width = FALSE, position = "center") %>% 
+  column_spec(1, bold = TRUE, border_right = TRUE)
+
+
+
+write.csv(summary_table, "./Generated_Data/Correlation_data/urchin_correlations_summary.csv", row.names = FALSE)
+
+```
+
+
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

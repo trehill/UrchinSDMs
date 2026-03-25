@@ -1,0 +1,1510 @@
+---
+title: "Comparing_predictors"
+author: "Tessa Rehill"
+date: "2025-05-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load packages
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(cowplot)
+library(terra)
+library(sf)
+library(ggspatial)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(forcats)
+library(patchwork)
+
+```
+
+#Predictor Influence ####
+##Green urchin 
+```{r}
+#Read in files ##################
+occurrence_PI <- read.csv("./Generated_Data/Predictor_Importance_datasets/GUR_Predictor_Importance.csv")
+
+density_PI <- read.csv("./Generated_Data/Evaluation_datasets/Count/GUR/GURcount_ensemble_variable_importance.csv")
+
+ordinal_PI <- read.csv("./Generated_Data/Evaluation_datasets/Ordinal/GUR/GURord_ensemble_variable_importance.csv")
+
+#Formating occurrence data #############
+
+Variable_Importance <- occurrence_PI
+
+#Summarize a mean value across all threshold metric for each importance metric
+  Threshold_Summary <- Variable_Importance %>% dplyr::group_by(predictors) %>% dplyr::summarise(across(TPR:IMAE, list(mean)))
+  colSums(Threshold_Summary[,2:11])
+  #Scale each column from TPR to IMAE so all of their values are rescaled between 0 and 100
+  Threshold_Summary[,2:11] <- data.frame(lapply(Threshold_Summary[,2:11], function(x){scale(x, center = FALSE, scale = sum(x, na.rm = TRUE)/100)}))
+  colSums(Threshold_Summary[,2:11])
+  
+  #Now pivot the dataframe longer and summarize a variable importance mean, stdev and stderr for each predictor
+  Summarized_Importance <- Threshold_Summary %>% pivot_longer(cols = TPR_1:IMAE_1, names_to = "metric", values_to = "value") %>% dplyr::group_by(predictors) %>% dplyr::summarise(Mean_Importance = mean(value, na.rm = TRUE), StDev_Importance = sd(value, na.rm = TRUE), StErr_Importance = stats::sd(value, na.rm = TRUE)/sqrt(n()))
+  #Calculate min and max values for error bars using stdev or sterr (I use stdev here)
+  Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+  Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+  
+  occurrence_SI <- Summarized_Importance 
+
+  occurrence_SI$type <- c('occurrence')
+  #occurrence_SI <- occurrence_SI %>% select(c('Mean_Importance', 'StDev_Importance', 'predictors', 'type', 'min', 'max'))
+  
+  
+#Formatting density data ################
+  #Rename
+  density_PI <- density_PI %>%
+  rename(predictors = expl.var)
+
+Variable_Importance <- density_PI
+
+# Pivot and summarize variable importance by predictor
+Summarized_Importance <- Variable_Importance %>%
+  pivot_longer(cols = var.imp, names_to = "metric", values_to = "value") %>%
+  dplyr::group_by(predictors) %>%
+  dplyr::summarise(
+    Mean_Importance = mean(value, na.rm = TRUE),
+    StDev_Importance = sd(value, na.rm = TRUE),
+    StErr_Importance = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Calculate the scaling factor based on the unscaled means
+scaling_factor <- sum(Summarized_Importance$Mean_Importance, na.rm = TRUE) / 100
+
+# Apply the same scaling factor to all importance metrics
+Summarized_Importance$Mean_Importance <- Summarized_Importance$Mean_Importance / scaling_factor
+Summarized_Importance$StDev_Importance <- Summarized_Importance$StDev_Importance / scaling_factor
+Summarized_Importance$StErr_Importance <- Summarized_Importance$StErr_Importance / scaling_factor
+
+# Calculate min and max for error bars using scaled standard deviation
+Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+
+# Check that the new scaled values add to 100
+colSums(Summarized_Importance[, "Mean_Importance"])
+  
+
+  density_SI <- Summarized_Importance 
+    
+  density_SI$type <- c('density')
+
+  
+#Format ordinal data 
+  #Rename
+  ordinal_PI <- ordinal_PI %>%
+  rename(predictors = expl.var)
+
+Variable_Importance <- ordinal_PI
+
+# Pivot and summarize variable importance by predictor
+Summarized_Importance <- Variable_Importance %>%
+  pivot_longer(cols = var.imp, names_to = "metric", values_to = "value") %>%
+  dplyr::group_by(predictors) %>%
+  dplyr::summarise(
+    Mean_Importance = mean(value, na.rm = TRUE),
+    StDev_Importance = sd(value, na.rm = TRUE),
+    StErr_Importance = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Calculate the scaling factor based on the unscaled means
+scaling_factor <- sum(Summarized_Importance$Mean_Importance, na.rm = TRUE) / 100
+
+# Apply the same scaling factor to all importance metrics
+Summarized_Importance$Mean_Importance <- Summarized_Importance$Mean_Importance / scaling_factor
+Summarized_Importance$StDev_Importance <- Summarized_Importance$StDev_Importance / scaling_factor
+Summarized_Importance$StErr_Importance <- Summarized_Importance$StErr_Importance / scaling_factor
+
+# Calculate min and max for error bars using scaled standard deviation
+Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+
+# Check that the new scaled values add to 100
+colSums(Summarized_Importance[, "Mean_Importance"])
+  
+
+  ordinal_SI <- Summarized_Importance 
+    
+  ordinal_SI$type <- c('relative abundance')
+  
+
+#Bind data together 
+  data <- rbind(density_SI, occurrence_SI, ordinal_SI)
+
+  
+  
+  green_data <- data
+  green_data$species <- c('green')
+  
+  
+```
+
+
+```{r}
+
+#Fix labels
+predictor_labels <- c(
+  do_10m_min      = "Minimum DO (bottom)",
+  do_10m_mean     = "Mean DO (bottom)",
+  temp_10m_mean   = "Mean Temperature (bottom)",
+  temp_10m_max    = "Maximum Temperature (bottom)",
+  temp_s_mean     = "Mean Temperature (surface)",
+  temperature_s_max = "Max Temperature (surface)",
+  REI             = "Relative Exposure Index (REI)",
+  temp_s_min      = "Minimum Temperature (surface)",
+  temp_s_max = "Maximum Temperature (surface)",
+  salt_10m_mean   = "Mean Salinity (bottom)",
+  temp_10m_min    = "Minimum Temperature (bottom)",
+  TAlk_10m_mean   = "Mean Alkalinity (bottom)",
+  salt_10m_min    = "Minimum Salinity (bottom)",
+  Rock            = "Rockiness", 
+  Slope = "Slope", 
+  Depth = "Depth", 
+  Current = "Current"
+)
+
+#Apply relabeling before combining with `type`
+data <- data %>%
+  mutate(type = factor(type, levels = c("occurrence", "density", "relative abundance")),
+         predictors_clean = predictor_labels[predictors],
+         y_lab = interaction(predictors_clean, type, sep = " - ")) %>%
+  arrange(type, desc(Mean_Importance)) %>%
+  mutate(y_lab = fct_rev(factor(y_lab, levels = unique(y_lab))))
+
+# Step 3: Plot
+Predictor_Plot <- ggplot(data) +
+  geom_col(
+    aes(x = Mean_Importance, y = y_lab, fill = type),
+    width = 0.7
+  ) +
+  geom_errorbar(
+    aes(xmin = min, xmax = max, y = y_lab),
+    width = 0.3,
+    size = 0.5
+  ) +
+  scale_fill_manual(
+    name = "",
+    values = c("occurrence" = "#1b5817", "density" = "#55C667FF", "relative abundance" = "#cfeec9"),
+    breaks = c("occurrence", "density", "relative abundance")
+  ) +
+  scale_y_discrete(labels = function(x) gsub(" - (occurrence|density|relative abundance)", "", x)) + 
+  theme_cowplot() +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 22), 
+    legend.position = "bottom",
+    legend.text = element_text(size = 20),       
+    legend.title = element_text(size = 22)) +
+    #legend.justification = c(1, 1) +
+  xlab("Predictor Importance (%)") +
+  ylab("Predictor Variable")
+
+Predictor_Plot
+
+Predictor_Plot_Green <- Predictor_Plot
+
+#save
+ggsave("./Plots/PI_Plots/GUR_Predictor_Plot.png", plot = Predictor_Plot, width = 10, height = 15, dpi = 300)
+
+```
+
+#Class plot
+```{r}
+
+data$Predictor_Class <- data$Predictor_Class
+data <- data %>%
+  mutate(
+    Predictor_Class = case_when(
+      grepl("temp", predictors) ~ "Temperature",
+      grepl("salt", predictors) ~ "Salinity",
+      #grepl("PAR", predictors) ~ "Light",
+      grepl("Rock", predictors) ~ "Substrate",
+      grepl("NH4|NO3", predictors) ~ "Nutrient",
+      grepl("Current|REI", predictors) ~ "Current/Exposure",
+      grepl("^do", predictors) ~ "Oxygen",
+      grepl("TAlk", predictors, ignore.case = TRUE) ~ "Alkalinity",
+      grepl("Slope|Depth|Aspect", predictors) ~ "Bathymetric",
+      TRUE ~ "None"  # Default case
+    )
+  )
+
+
+# Reverse factor levels to get occurrence on top
+data$type <- factor(data$type, levels = c("relative abundance", "density", "occurrence"))
+
+type_colors <- c(
+  occurrence = "#1b5817",
+  density = "#55C667FF",
+  "relative abundance" = "#cfeec9"
+)
+
+class_type_summary <- data %>%
+  group_by(Predictor_Class, type) %>%
+  summarise(Predictor_Imp = sum(Mean_Importance), .groups = "drop")
+
+
+class_type_plot <- ggplot(class_type_summary, 
+                          aes(x = Predictor_Imp, 
+                              y = reorder(Predictor_Class, Predictor_Imp), 
+                              fill = type)) +
+  geom_col(position = position_dodge2(preserve = "single", padding = 0), width = 0.7) +
+  scale_fill_manual(values = type_colors, 
+    breaks = c("occurrence", "density", "relative abundance")) +
+  theme_cowplot() +
+  guides(x.sec = "axis", y.sec = "axis") +
+  theme(axis.line.y.left = element_line(size = 0.75, color = "black"),
+        axis.line.y.right = element_line(size = 0.75, color = "black"),
+        axis.line.x.top = element_line(size = 0.75, color = "black"),
+        axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+        axis.ticks.x.top = element_blank(), 
+        axis.ticks.y.right = element_blank(),
+        axis.text.x.top = element_blank(), 
+        axis.text.y.right = element_blank(),
+        axis.title = element_text(size = 26), 
+        axis.text.x = element_text(size = 22), 
+        axis.text.y = element_text(size = 22), 
+        legend.position = "top",
+    legend.text = element_text(size = 20),       # <-- Increase legend text size
+    legend.title = element_text(size = 22), 
+    plot.title = element_text(size = 28, face = "bold", hjust = 0.5)
+) +
+  xlab("Predictor Importance (%)") + 
+  ylab(" ") + 
+  labs(fill = "  ") + labs(title = "Green urchin")
+
+class_type_plot
+
+
+PredictorClass_Plot_Green <- class_type_plot
+
+ggsave("./Plots/PI_Plots/GUR_PredictorClass_Plot.png", plot = class_type_plot,  width = 20,        
+  height = 8,   dpi = 300)
+
+```
+
+##Red Urchin 
+```{r}
+#Read in files ##################
+occurrence_PI <- read.csv("./Generated_Data/Predictor_Importance_datasets/RUR_Predictor_Importance.csv")
+
+density_PI <- read.csv("./Generated_Data/Evaluation_datasets/Count/RUR/RURcount_ensemble_variable_importance.csv")
+
+ordinal_PI <- read.csv("./Generated_Data/Evaluation_datasets/Ordinal/RUR/RURord_ensemble_variable_importance.csv")
+
+#Formating occurrence data #############
+
+Variable_Importance <- occurrence_PI
+
+#Summarize a mean value across all threshold metric for each importance metric
+  Threshold_Summary <- Variable_Importance %>% dplyr::group_by(predictors) %>% dplyr::summarise(across(TPR:IMAE, list(mean)))
+  colSums(Threshold_Summary[,2:11])
+  #Scale each column from TPR to IMAE so all of their values are rescaled between 0 and 100
+  Threshold_Summary[,2:11] <- data.frame(lapply(Threshold_Summary[,2:11], function(x){scale(x, center = FALSE, scale = sum(x, na.rm = TRUE)/100)}))
+  colSums(Threshold_Summary[,2:11])
+  
+  #Now pivot the dataframe longer and summarize a variable importance mean, stdev and stderr for each predictor
+  Summarized_Importance <- Threshold_Summary %>% pivot_longer(cols = TPR_1:IMAE_1, names_to = "metric", values_to = "value") %>% dplyr::group_by(predictors) %>% dplyr::summarise(Mean_Importance = mean(value, na.rm = TRUE), StDev_Importance = sd(value, na.rm = TRUE), StErr_Importance = stats::sd(value, na.rm = TRUE)/sqrt(n()))
+  #Calculate min and max values for error bars using stdev or sterr (I use stdev here)
+  Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+  Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+  
+  occurrence_SI <- Summarized_Importance 
+
+  occurrence_SI$type <- c('occurrence')
+  #occurrence_SI <- occurrence_SI %>% select(c('Mean_Importance', 'StDev_Importance', 'predictors', 'type', 'min', 'max'))
+  
+  
+#Formatting density data ################
+  #Rename
+  density_PI <- density_PI %>%
+  rename(predictors = expl.var)
+
+Variable_Importance <- density_PI
+
+# Pivot and summarize variable importance by predictor
+Summarized_Importance <- Variable_Importance %>%
+  pivot_longer(cols = var.imp, names_to = "metric", values_to = "value") %>%
+  dplyr::group_by(predictors) %>%
+  dplyr::summarise(
+    Mean_Importance = mean(value, na.rm = TRUE),
+    StDev_Importance = sd(value, na.rm = TRUE),
+    StErr_Importance = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Calculate the scaling factor based on the unscaled means
+scaling_factor <- sum(Summarized_Importance$Mean_Importance, na.rm = TRUE) / 100
+
+# Apply the same scaling factor to all importance metrics
+Summarized_Importance$Mean_Importance <- Summarized_Importance$Mean_Importance / scaling_factor
+Summarized_Importance$StDev_Importance <- Summarized_Importance$StDev_Importance / scaling_factor
+Summarized_Importance$StErr_Importance <- Summarized_Importance$StErr_Importance / scaling_factor
+
+# Calculate min and max for error bars using scaled standard deviation
+Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+
+# Check that the new scaled values add to 100
+colSums(Summarized_Importance[, "Mean_Importance"])
+  
+
+  density_SI <- Summarized_Importance 
+    
+  density_SI$type <- c('density')
+
+  
+#Format ordinal data 
+  #Rename
+  ordinal_PI <- ordinal_PI %>%
+  rename(predictors = expl.var)
+
+Variable_Importance <- ordinal_PI
+
+# Pivot and summarize variable importance by predictor
+Summarized_Importance <- Variable_Importance %>%
+  pivot_longer(cols = var.imp, names_to = "metric", values_to = "value") %>%
+  dplyr::group_by(predictors) %>%
+  dplyr::summarise(
+    Mean_Importance = mean(value, na.rm = TRUE),
+    StDev_Importance = sd(value, na.rm = TRUE),
+    StErr_Importance = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Calculate the scaling factor based on the unscaled means
+scaling_factor <- sum(Summarized_Importance$Mean_Importance, na.rm = TRUE) / 100
+
+# Apply the same scaling factor to all importance metrics
+Summarized_Importance$Mean_Importance <- Summarized_Importance$Mean_Importance / scaling_factor
+Summarized_Importance$StDev_Importance <- Summarized_Importance$StDev_Importance / scaling_factor
+Summarized_Importance$StErr_Importance <- Summarized_Importance$StErr_Importance / scaling_factor
+
+# Calculate min and max for error bars using scaled standard deviation
+Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+
+# Check that the new scaled values add to 100
+colSums(Summarized_Importance[, "Mean_Importance"])
+  
+
+  ordinal_SI <- Summarized_Importance 
+    
+  ordinal_SI$type <- c('relative abundance')
+  
+
+#Bind data together 
+  data <- rbind(density_SI, occurrence_SI, ordinal_SI)
+
+
+  red_data <- data
+  red_data$species <- c('red')
+  
+
+
+```
+###All predictor plots
+```{r}
+#Fix labels
+predictor_labels <- c(
+  do_10m_min      = "Minimum DO (bottom)",
+  do_10m_mean     = "Mean DO (bottom)",
+  temp_10m_mean   = "Mean Temperature (bottom)",
+  temp_10m_max    = "Maximum Temperature (bottom)",
+  temp_s_mean     = "Mean Temperature (surface)",
+  temperature_s_max = "Max Temperature (surface)",
+  REI             = "Relative Exposure Index (REI)",
+  temp_s_min      = "Minimum Temperature (surface)",
+  temp_s_max = "Maximum Temperature (surface)",
+  salt_10m_mean   = "Mean Salinity (bottom)",
+  temp_10m_min    = "Minimum Temperature (bottom)",
+  TAlk_10m_mean   = "Mean Alkalinity (bottom)",
+  salt_10m_min    = "Minimum Salinity (bottom)",
+  Rock            = "Rockiness", 
+  Slope = "Slope", 
+  Depth = "Depth", 
+  Current = "Current"
+)
+
+#Apply relabeling before combining with `type`
+data <- data %>%
+  mutate(type = factor(type, levels = c("occurrence", "density", "relative abundance")),
+         predictors_clean = predictor_labels[predictors],
+         y_lab = interaction(predictors_clean, type, sep = " - ")) %>%
+  arrange(type, desc(Mean_Importance)) %>%
+  mutate(y_lab = fct_rev(factor(y_lab, levels = unique(y_lab))))
+
+# Step 3: Plot
+Predictor_Plot <- ggplot(data) +
+  geom_col(
+    aes(x = Mean_Importance, y = y_lab, fill = type),
+    width = 0.7
+  ) +
+  geom_errorbar(
+    aes(xmin = min, xmax = max, y = y_lab),
+    width = 0.3,
+    size = 0.5
+  ) +
+  scale_fill_manual(
+    name = "",
+    values = c("occurrence" = "#760b08", "density" = "#e6360F", "relative abundance" = "#f8b4b2"),
+    breaks = c("occurrence", "density", "relative abundance")
+  ) +
+  scale_y_discrete(labels = function(x) gsub(" - (occurrence|density|relative abundance)", "", x)) + 
+  theme_cowplot() +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 22), 
+    legend.position = "bottom",
+    legend.text = element_text(size = 20),       # <-- Increase legend text size
+    legend.title = element_text(size = 22)) +
+  xlab("Predictor Importance (%)") +
+  ylab("")
+
+Predictor_Plot
+
+Predictor_Plot_Red <- Predictor_Plot
+
+#save
+ggsave("./Plots/PI_Plots/RUR_Predictor_Plot.png", plot = Predictor_Plot, width = 10, height = 15, dpi = 300)
+```
+
+###Class plot
+```{r}
+
+data$Predictor_Class <- data$Predictor_Class
+data <- data %>%
+  mutate(
+    Predictor_Class = case_when(
+      grepl("temp", predictors) ~ "Temperature",
+      grepl("salt", predictors) ~ "Salinity",
+      #grepl("PAR", predictors) ~ "Light",
+      grepl("Rock", predictors) ~ "Substrate",
+      grepl("NH4|NO3", predictors) ~ "Nutrient",
+      grepl("Current|REI", predictors) ~ "Current/Exposure",
+      grepl("^do", predictors) ~ "Oxygen",
+      grepl("TAlk", predictors, ignore.case = TRUE) ~ "Alkalinity",
+      grepl("Slope|Depth|Aspect", predictors) ~ "Bathymetric",
+      TRUE ~ "None"  # Default case
+    )
+  )
+
+
+# Reverse factor levels to get occurrence on top
+data$type <- factor(data$type, levels = c("relative abundance", "density", "occurrence"))
+
+type_colors <- c(
+  occurrence = "#760b08",
+  density = "#e6360F",
+  "relative abundance" = "#f8b4b2"
+)
+
+class_type_summary <- data %>%
+  group_by(Predictor_Class, type) %>%
+  summarise(Predictor_Imp = sum(Mean_Importance), .groups = "drop")
+
+
+class_type_plot <- ggplot(class_type_summary, 
+                          aes(x = Predictor_Imp, 
+                              y = reorder(Predictor_Class, Predictor_Imp), 
+                              fill = type)) +
+  geom_col(position = position_dodge2(preserve = "single", padding = 0), width = 0.7) +
+  scale_fill_manual(values = type_colors, 
+    breaks = c("occurrence", "density", "relative abundance")) +
+  theme_cowplot() +
+  guides(x.sec = "axis", y.sec = "axis") +
+  theme(axis.line.y.left = element_line(size = 0.75, color = "black"),
+        axis.line.y.right = element_line(size = 0.75, color = "black"),
+        axis.line.x.top = element_line(size = 0.75, color = "black"),
+        axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+        axis.ticks.x.top = element_blank(), 
+        axis.ticks.y.right = element_blank(),
+        axis.text.x.top = element_blank(), 
+        axis.text.y.right = element_blank(),
+        axis.title = element_text(size = 26), 
+        axis.text.x = element_text(size = 22), 
+        axis.text.y = element_text(size = 22), 
+        legend.position = "top",
+    legend.text = element_text(size = 20),       # <-- Increase legend text size
+    legend.title = element_text(size = 22), 
+    plot.title = element_text(size = 28, face = "bold", hjust = 0.5)
+) +
+  xlab("Predictor Importance (%)") + 
+  ylab(" ") + 
+  labs(fill = "  ", title = "Red urchin")
+
+class_type_plot
+
+
+PredictorClass_Plot_Red <- class_type_plot
+
+ggsave("./Plots/PI_Plots/RUR_PredictorClass_Plot.png", plot = class_type_plot,   width = 16,        
+  height = 8,   dpi = 300)
+```
+#Purple Urchin 
+```{r}
+#Read in files ##################
+occurrence_PI <- read.csv("./Generated_Data/Predictor_Importance_datasets/PUR_Predictor_Importance.csv")
+
+#ordinal_PI <- read.csv("./Generated_Data/Evaluation_datasets/Ordinal/PUR/PURord_ensemble_variable_importance.csv")
+
+#Formating occurrence data #############
+
+Variable_Importance <- occurrence_PI
+
+#Summarize a mean value across all threshold metric for each importance metric
+  Threshold_Summary <- Variable_Importance %>% dplyr::group_by(predictors) %>% dplyr::summarise(across(TPR:IMAE, list(mean)))
+  colSums(Threshold_Summary[,2:11])
+  #Scale each column from TPR to IMAE so all of their values are rescaled between 0 and 100
+  Threshold_Summary[,2:11] <- data.frame(lapply(Threshold_Summary[,2:11], function(x){scale(x, center = FALSE, scale = sum(x, na.rm = TRUE)/100)}))
+  colSums(Threshold_Summary[,2:11])
+  
+  #Now pivot the dataframe longer and summarize a variable importance mean, stdev and stderr for each predictor
+  Summarized_Importance <- Threshold_Summary %>% pivot_longer(cols = TPR_1:IMAE_1, names_to = "metric", values_to = "value") %>% dplyr::group_by(predictors) %>% dplyr::summarise(Mean_Importance = mean(value, na.rm = TRUE), StDev_Importance = sd(value, na.rm = TRUE), StErr_Importance = stats::sd(value, na.rm = TRUE)/sqrt(n()))
+  #Calculate min and max values for error bars using stdev or sterr (I use stdev here)
+  Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+  Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+  
+  occurrence_SI <- Summarized_Importance 
+
+  occurrence_SI$type <- c('occurrence')
+  #occurrence_SI <- occurrence_SI %>% select(c('Mean_Importance', 'StDev_Importance', 'predictors', 'type', 'min', 'max'))
+  
+  
+
+#Format ordinal data 
+  #Rename
+  #ordinal_PI <- ordinal_PI %>%
+  #rename(predictors = expl.var)
+
+#Variable_Importance <- ordinal_PI
+
+# Pivot and summarize variable importance by predictor
+#Summarized_Importance <- Variable_Importance %>%
+  #pivot_longer(cols = var.imp, names_to = "metric", values_to = "value") %>%
+  #dplyr::group_by(predictors) %>%
+  #dplyr::summarise(
+   # Mean_Importance = mean(value, na.rm = TRUE),
+   # StDev_Importance = sd(value, na.rm = TRUE),
+   # StErr_Importance = sd(value, na.rm = TRUE) / sqrt(n()),
+   # .groups = "drop"
+ # )
+
+# Calculate the scaling factor based on the unscaled means
+#scaling_factor <- sum(Summarized_Importance$Mean_Importance, na.rm = TRUE) / 100
+
+# Apply the same scaling factor to all importance metrics
+#Summarized_Importance$Mean_Importance <- Summarized_Importance$Mean_Importance / scaling_factor
+#Summarized_Importance$StDev_Importance <- Summarized_Importance$StDev_Importance / scaling_factor
+#Summarized_Importance$StErr_Importance <- Summarized_Importance$StErr_Importance / scaling_factor
+
+# Calculate min and max for error bars using scaled standard deviation
+#Summarized_Importance$min <- Summarized_Importance$Mean_Importance - Summarized_Importance$StDev_Importance
+#Summarized_Importance$max <- Summarized_Importance$Mean_Importance + Summarized_Importance$StDev_Importance
+
+# Check that the new scaled values add to 100
+#colSums(Summarized_Importance[, "Mean_Importance"])
+  
+
+ # ordinal_SI <- Summarized_Importance 
+    
+ # ordinal_SI$type <- c('relative abundance')
+  
+
+#Bind data together 
+ # data <- rbind(occurrence_SI, ordinal_SI)
+
+
+  purple_data <- occurrence_SI
+  purple_data$species <- c('purple')
+```
+
+###All predictor plots
+```{r}
+predictor_labels <- c(
+  do_10m_min      = "Minimum DO (bottom)",
+  do_10m_mean     = "Mean DO (bottom)",
+  temp_10m_mean   = "Mean Temperature (bottom)",
+  temp_10m_max    = "Maximum Temperature (bottom)",
+  temp_s_mean     = "Mean Temperature (surface)",
+  temperature_s_max = "Max Temperature (surface)",
+  REI             = "Relative Exposure Index (REI)",
+  temp_s_min      = "Minimum Temperature (surface)",
+  temp_s_max = "Maximum Temperature (surface)",
+  salt_10m_mean   = "Mean Salinity (bottom)",
+  temp_10m_min    = "Minimum Temperature (bottom)",
+  TAlk_10m_mean   = "Mean Alkalinity (bottom)",
+  salt_10m_min    = "Minimum Salinity (bottom)",
+  Rock            = "Rockiness", 
+  Slope = "Slope", 
+  Depth = "Depth", 
+  Current = "Current"
+)
+
+#Apply relabeling before combining with `type`
+data <- purple_data %>%
+  mutate(type = factor(type, levels = c("occurrence", "relative abundance")),
+         predictors_clean = predictor_labels[predictors],
+         y_lab = interaction(predictors_clean, type, sep = " - ")) %>%
+  arrange(type, desc(Mean_Importance)) %>%
+  mutate(y_lab = fct_rev(factor(y_lab, levels = unique(y_lab))))
+
+# Step 3: Plot
+Predictor_Plot <- ggplot(data) +
+  geom_col(
+    aes(x = Mean_Importance, y = y_lab, fill = type),
+    width = 0.7
+  ) +
+  geom_errorbar(
+    aes(xmin = min, xmax = max, y = y_lab),
+    width = 0.3,
+    size = 0.5
+  ) +
+  scale_fill_manual(
+    name = "",
+    values = c("occurrence" = "#420b7f", "relative abundance" = "#d8baf9"),
+    breaks = c("occurrence", "relative abundance")
+  ) +
+  scale_y_discrete(labels = function(x) gsub(" - (occurrence|relative abundance)", "", x)) + 
+  theme_cowplot() +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 22), 
+    legend.position= "bottom"
+  ) +
+  xlab("Predictor Importance (%)") +
+  ylab("Predictor Variable")
+
+Predictor_Plot
+
+#Remove ordinal
+#Apply relabeling before combining with `type`
+data <- data %>%
+  filter(type == "occurrence") %>%
+  mutate(type = factor(type, levels = c("occurrence")),
+         predictors_clean = predictor_labels[predictors],
+         y_lab = interaction(predictors_clean, type, sep = " - ")) %>%
+  arrange(type, desc(Mean_Importance)) %>%
+  mutate(y_lab = fct_rev(factor(y_lab, levels = unique(y_lab))))
+
+# Step 3: Plot
+Predictor_Plot <- ggplot(data) +
+  geom_col(
+    aes(x = Mean_Importance, y = y_lab, fill = type),
+    width = 0.7
+  ) +
+  geom_errorbar(
+    aes(xmin = min, xmax = max, y = y_lab),
+    width = 0.3,
+    size = 0.5
+  ) +
+  scale_fill_manual(
+    name = "",
+    values = c("occurrence" = "#a503fc"),#420b7f
+    breaks = c("occurrence")
+  ) +
+  scale_y_discrete(labels = function(x) gsub(" - (occurrence)", "", x)) + 
+  theme_cowplot() +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 22), 
+    legend.position= "top"
+  ) +
+  xlab("Predictor Importance (%)") +
+  ylab("Predictor Variable")
+
+Predictor_Plot
+
+
+Predictor_Plot_Purple <- Predictor_Plot
+
+#save
+ggsave("./Plots/PI_Plots/PUR_Predictor_Plot.png", plot = Predictor_Plot, width = 15, height = 10, dpi = 300)
+```
+
+###Class plot 
+```{r}
+data$Predictor_Class <- data$Predictor_Class
+data <- purple_data %>%
+  mutate(
+    Predictor_Class = case_when(
+      grepl("temp", predictors) ~ "Temperature",
+      grepl("salt", predictors) ~ "Salinity",
+      #grepl("PAR", predictors) ~ "Light",
+      grepl("Rock", predictors) ~ "Substrate",
+      grepl("NH4|NO3", predictors) ~ "Nutrient",
+      grepl("Current|REI", predictors) ~ "Current/Exposure",
+      grepl("^do", predictors) ~ "Oxygen",
+      grepl("TAlk", predictors, ignore.case = TRUE) ~ "Alkalinity",
+      grepl("Slope|Depth|Aspect", predictors) ~ "Bathymetric",
+      TRUE ~ "None"  # Default case
+    )
+  )
+
+
+# Reverse factor levels to get occurrence on top
+data$type <- factor(data$type, levels = c("relative abundance", "occurrence"))
+
+type_colors <- c(
+  occurrence = "#420b7f",
+  "relative abundance" = "#d8baf9"
+)
+
+class_type_summary <- data %>%
+  group_by(Predictor_Class, type) %>%
+  summarise(Predictor_Imp = sum(Mean_Importance), .groups = "drop")
+
+
+class_type_plot <- ggplot(class_type_summary, 
+                          aes(x = Predictor_Imp, 
+                              y = reorder(Predictor_Class, Predictor_Imp), 
+                              fill = type)) +
+  geom_col(position = position_dodge2(preserve = "single", padding = 0), width = 0.7) +
+  scale_fill_manual(values = type_colors, 
+    breaks = c("occurrence", "relative abundance")) +
+  theme_cowplot() +
+  guides(x.sec = "axis", y.sec = "axis") +
+  theme(axis.line.y.left = element_line(size = 0.75, color = "black"),
+        axis.line.y.right = element_line(size = 0.75, color = "black"),
+        axis.line.x.top = element_line(size = 0.75, color = "black"),
+        axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+        axis.ticks.x.top = element_blank(), 
+        axis.ticks.y.right = element_blank(),
+        axis.text.x.top = element_blank(), 
+        axis.text.y.right = element_blank(),
+        axis.title = element_text(size = 26), 
+        axis.text.x = element_text(size = 22), 
+        axis.text.y = element_text(size = 22), 
+        legend.position = "bottom") +
+  xlab("Predictor Importance (%)") + 
+  ylab(" ") + 
+  labs(fill = "  ", labs(title = "Purple urchin"))
+
+class_type_plot
+
+
+data$Predictor_Class <- data$Predictor_Class
+data <- data %>%
+  mutate(
+    Predictor_Class = case_when(
+      grepl("temp", predictors) ~ "Temperature",
+      grepl("salt", predictors) ~ "Salinity",
+      #grepl("PAR", predictors) ~ "Light",
+      grepl("Rock", predictors) ~ "Substrate",
+      grepl("NH4|NO3", predictors) ~ "Nutrient",
+      grepl("Current|REI", predictors) ~ "Current/Exposure",
+      grepl("^do", predictors) ~ "Oxygen",
+      grepl("TAlk", predictors, ignore.case = TRUE) ~ "Alkalinity",
+      grepl("Slope|Depth|Aspect", predictors) ~ "Bathymetric",
+      TRUE ~ "None"  # Default case
+    )
+  )
+
+
+# Reverse factor levels to get occurrence on top
+data$type <- factor(data$type, levels = c("relative abundance", "occurrence"))
+
+data<- data %>% 
+  filter(type == "occurrence")
+
+type_colors <- c(
+  occurrence = "#420b7f"
+)
+
+class_type_summary <- data %>%
+  group_by(Predictor_Class, type) %>%
+  summarise(Predictor_Imp = sum(Mean_Importance), .groups = "drop")
+
+
+class_type_plot <- ggplot(class_type_summary, 
+                          aes(x = Predictor_Imp, 
+                              y = reorder(Predictor_Class, Predictor_Imp), 
+                              fill = type)) +
+  geom_col(position = position_dodge2(preserve = "single", padding = 0), width = 0.7) +
+  scale_fill_manual(values = type_colors, 
+    breaks = c("occurrence", "density", "relative abundance")) +
+  theme_cowplot() +
+  guides(x.sec = "axis", y.sec = "axis") +
+  theme(axis.line.y.left = element_line(size = 0.75, color = "black"),
+        axis.line.y.right = element_line(size = 0.75, color = "black"),
+        axis.line.x.top = element_line(size = 0.75, color = "black"),
+        axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+        axis.ticks.x.top = element_blank(), 
+        axis.ticks.y.right = element_blank(),
+        axis.text.x.top = element_blank(), 
+        axis.text.y.right = element_blank(),
+        axis.title = element_text(size = 26), 
+        axis.text.x = element_text(size = 22), 
+        axis.text.y = element_text(size = 22), 
+        legend.position = "top",
+    legend.text = element_text(size = 20),       # <-- Increase legend text size
+    legend.title = element_text(size = 22), 
+    plot.title = element_text(size = 28, face = "bold", hjust = 0.5)
+) +
+  xlab("Predictor Importance (%)") + 
+  ylab(" ") + 
+  labs(fill = "  ", title = "Purple urchin")
+
+class_type_plot
+
+
+PredictorClass_Plot_Purple <- class_type_plot
+
+ggsave("./Plots/PI_Plots/PUR_PredictorClass_Plot.png", plot = class_type_plot,   width = 16,        
+  height = 8,   dpi = 300)
+```
+
+#Plot em all together
+```{r}
+#Arrange plots side by side
+combined_plot <-PredictorClass_Plot_Purple + PredictorClass_Plot_Green + PredictorClass_Plot_Red +
+  plot_layout(ncol = 3, widths = c(1,1,1)) + 
+  plot_annotation(tag_levels = 'a')
+
+combined_plot <- combined_plot & 
+  theme(
+    plot.tag = element_text(
+      size = 30, 
+      face = "bold", 
+      color = "black",   # to check if change is applied visually
+      family = "Times",
+      hjust = 0, 
+      vjust = 1
+    )
+  )
+
+ggsave("./Plots/PI_Plots/Combined_PredictorClass_Plot.png", plot = combined_plot,   width = 30,        
+  height = 10,    dpi = 300)
+
+#Arrange plots side by side
+combined_plot <- PredictorClass_Plot_Purple
+
+ggsave("./Plots/PI_Plots/Purple_PredictorClass_Plot.png", plot = combined_plot,   width = 30,        
+  height = 10,    dpi = 300)
+
+
+#Arrange plots side by side
+combined_plot <- Predictor_Plot_Green + Predictor_Plot_Red + 
+  plot_layout(ncol = 2) +      # 2 plots → 2 columns
+  plot_annotation(tag_levels = 'a')  # add tags "a", "b"
+
+combined_plot <- combined_plot & theme(
+  plot.tag = element_text(size = 30, face = "bold", family = "Times", color = "black")
+)
+ggsave("./Plots/PI_Plots/Combined_Predictor_Plot.png", plot = combined_plot,   width = 25,        
+  height = 16,    dpi = 300)
+
+#Arrange plots side by side
+combined_plot <- Predictor_Plot_Purple
+
+combined_plot <- combined_plot & 
+  theme(
+    plot.tag = element_text(
+      size = 30, 
+      face = "bold", 
+      color = "black",   # to check if change is applied visually
+      family = "Times",
+      hjust = 0, 
+      vjust = 1
+    )
+  )
+
+ggsave("./Plots/PI_Plots/Purple_Predictor_Plot.png", plot = combined_plot,   width = 20,        
+  height = 16,    dpi = 300)
+
+```
+
+
+##Plotting all species on the same graph
+```{r}
+
+#Formatting data
+  #combine all data
+  all_data <- rbind(purple_data, green_data, red_data)
+  
+
+predictor_labels <- c(
+  do_10m_min        = "Minimum DO (bottom)",
+  do_10m_mean       = "Mean DO (bottom)",
+  temp_10m_mean     = "Mean Temperature (bottom)",
+  temp_10m_max      = "Maximum Temperature (bottom)",
+  temp_s_mean       = "Mean Temperature (surface)",
+  temperature_s_max = "Max Temperature (surface)",
+  REI               = "Relative Exposure Index (REI)",
+  temp_s_min        = "Minimum Temperature (surface)",
+  temp_s_max        = "Maximum Temperature (surface)",
+  salt_10m_mean     = "Mean Salinity (bottom)",
+  temp_10m_min      = "Minimum Temperature (bottom)",
+  TAlk_10m_mean     = "Mean Alkalinity (bottom)",
+  salt_10m_min      = "Minimum Salinity (bottom)",
+  Rock              = "Rockiness", 
+  Slope             = "Slope", 
+  Depth             = "Depth", 
+  Current           = "Current"
+)
+
+# Replace values in the column using the named vector
+all_data$predictors <- predictor_labels[as.character(all_data$predictors)]
+
+  
+#Plotting all occurrence ########################
+  occurrence <- all_data %>% filter(type == "occurrence")
+
+# Ensure 'predictors' is a factor to preserve order in the plot
+predictor_order <- occurrence %>%
+  dplyr::group_by(predictors) %>%
+  dplyr::summarise(total_importance = sum(Mean_Importance, na.rm = TRUE)) %>%
+  dplyr::arrange(total_importance)
+
+occurrence$predictors <- factor(occurrence$predictors, levels = predictor_order$predictors)
+
+# Create the plot 
+occurrence <- ggplot(occurrence, aes(x = Mean_Importance, 
+                     y = predictors, 
+                     fill = species)) +
+  geom_col(position = position_dodge(width = 0.8)) +  # Side-by-side bars
+  geom_errorbar(aes(xmin = Mean_Importance - StDev_Importance,
+                    xmax = Mean_Importance + StDev_Importance),
+                position = position_dodge(width = 0.9),
+                width = 0.3) +
+  labs(x = "Mean Importance", y = "Predictor", fill = "Species", title = "Occurrence") +
+  theme_cowplot() +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 10),
+    legend.position = "bottom"  # Move legend below the plot
+  ) + 
+  xlab("Predictor Importance (%)") + 
+  ylab("Predictor Variable") + 
+  scale_fill_manual(
+    name = "Species",
+    values = c(
+      "red" = "#cd654c",
+      "green" = "#30a350",
+      "purple" = "#894ccd"), 
+      breaks = c("green", "purple", "red")
+    )
+  
+#Plotting all density #################
+
+density <- all_data %>% filter(type == "density")
+
+# Ensure 'predictors' is a factor to preserve order in the plot
+predictor_order <- density %>%
+  dplyr::group_by(predictors) %>%
+  dplyr::summarise(total_importance = sum(Mean_Importance, na.rm = TRUE)) %>%
+  dplyr::arrange(total_importance)
+
+density$predictors <- factor(density$predictors, levels = predictor_order$predictors)
+
+# Create the plot
+density <- ggplot(density, aes(x = Mean_Importance, 
+                     y = predictors, 
+                     fill = species)) +
+  geom_col(position = position_dodge(width = 0.8)) +  # Side-by-side bars
+  geom_errorbar(aes(xmin = Mean_Importance - StDev_Importance,
+                    xmax = Mean_Importance + StDev_Importance),
+                position = position_dodge(width = 0.9),
+                width = 0.3) +
+  labs(x = "Mean Importance", y = NULL, fill = "Species", title= "density") +
+  theme_cowplot() +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 10), 
+    legend.position = "none"
+  ) + 
+  xlab("Predictor Importance (%)") + 
+  scale_fill_manual(
+    name = "Species",
+    values = c(
+      "red" = "#cd654c",
+      "green" = "#30a350"
+     # "purple" = "#a503fc"
+    )
+  )
+
+#Plotting all relative data #############
+RA <- all_data %>% filter(type == "relative abundance")
+
+# Ensure 'predictors' is a factor to preserve order in the plot
+predictor_order <- RA %>%
+  dplyr::group_by(predictors) %>%
+  dplyr::summarise(total_importance = sum(Mean_Importance, na.rm = TRUE)) %>%
+  dplyr::arrange(total_importance)
+
+RA$predictors <- factor(RA$predictors, levels = predictor_order$predictors)
+
+# Create the plot
+relative <- ggplot(RA, aes(x = Mean_Importance, 
+                     y = predictors, 
+                     fill = species)) +
+  geom_col(position = position_dodge(width = 0.8)) +  # Side-by-side bars
+  geom_errorbar(aes(xmin = Mean_Importance - StDev_Importance,
+                    xmax = Mean_Importance + StDev_Importance),
+                position = position_dodge(width = 0.9),
+                width = 0.3) +
+  labs(x = "Mean Importance", y = NULL, fill = "Species", title = "Relative Abundance") +
+  theme_cowplot() +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 26),
+    axis.text.x = element_text(size = 22),
+    axis.text.y = element_text(size = 10), 
+    legend.position = "none"
+  ) + 
+  xlab("Predictor Importance (%)") + 
+  scale_fill_manual(
+    name = "Species",
+    values = c(
+      "red" = "#cd654c",
+      "green" = "#30a350",
+      "purple" = "#894ccd"
+    )
+  )
+
+
+# Arrange plots side by side
+combined_plot <- occurrence + density + relative + 
+  plot_layout(ncol = 3)  # 3 plots in one row
+
+# Display combined plot
+print(combined_plot)
+
+ggsave("./Plots/PI_Plots/Combined_Species_PI.png", plot = combined_plot, width = 20, height = 10, dpi = 300)
+
+```
+
+#Comparing Response Curves ####
+#Presence 
+```{r}
+#Load data ###
+source("General_Functions.R")
+
+GUR_ES_Preds <- read.csv("./Generated_Data/ES_datasets/GUR_ES_Preds.csv")
+RUR_ES_Preds <- read.csv("./Generated_Data/ES_datasets/RUR_ES_Preds.csv")
+PUR_ES_Preds <- read.csv("./Generated_Data/ES_datasets/PUR_ES_Preds.csv")
+#Set up dataframes for performing the evaluation strip method for any Urchin species 
+Hindcast_df <- terra::as.data.frame(terra::rast("./processed_data/ENV_Layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif")) %>% na.omit() 
+
+Hindcast_df <- Hindcast_df[, !names(Hindcast_df) %in% "Depth"]
+
+gc()
+
+#Calculate the means for each environmental variable
+Enviro_Means <- colMeans(Hindcast_df)
+#Calculate the max and min for each variable
+Enviro_Max <- colMax(Hindcast_df)
+Enviro_Min <- colMin(Hindcast_df)
+
+#Create a dataframe for prediction to occur onto for each of the predictor variables of interest.
+#Set up a base dataframe
+Evaluation_Strip_Base <- data.frame()
+Evaluation_Strip_Base_Max <- data.frame()
+Evaluation_Strip_Base_Min <- data.frame()
+for (i in 1:1000){
+  Evaluation_Strip_Base[i,1:ncol(Hindcast_df)] <- Enviro_Means
+  Evaluation_Strip_Base_Max[i,1:ncol(Hindcast_df)] <- Enviro_Max
+  Evaluation_Strip_Base_Min[i,1:ncol(Hindcast_df)] <- Enviro_Min
+}
+#name the dataframe columns
+colnames(Evaluation_Strip_Base) <- colnames(Hindcast_df)
+colnames(Evaluation_Strip_Base_Max) <- colnames(Hindcast_df)
+colnames(Evaluation_Strip_Base_Min) <- colnames(Hindcast_df)
+
+#Set up a dataframe where values ranging the full environmental conditions for each variable are stored
+Evaluation_Strip_Range <- Evaluation_Strip_Base
+for (i in 1:ncol(Evaluation_Strip_Range)){
+  Evaluation_Strip_Range[,i] <- seq(from = Enviro_Min[i], to = Enviro_Max[i], length.out = 1000)
+}
+
+#Load in hindcast climatology #CODEEDIT select for only the variables I want included in my models
+Hindcast_Climatology <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif")
+Hindcast_Climatology <- terra::subset(Hindcast_Climatology, names(Hindcast_Climatology) != "Depth")
+
+
+#Running for a single species
+Predictor_Names <- c("Talkbmax (mEq/m³)", "Sbmean (PSU)", "Sbmin (PSU)","Tsmean (\u00B0C)", "Tsmax (\u00B0C)", "Tsmin (\u00B0C)", "Tbmean (\u00B0C)", "Tbmax (\u00B0C)", "Tbmin (\u00B0C)", "Oxybmean (mmol/m^3)", "Oxybmin (mmol/m^3)", "Current (m/s)", "REI", "Percent Rock (%)", "Slope (deg)") #CODEEDIT: change this based on the predictors being used
+Predictor_IDs <- names(Hindcast_Climatology)
+
+#Plotting
+#Plotting function
+ES_CompareSpeciesPlotter <- function(GUR_ES, RUR_ES, PUR_ES, var_id, var_name){
+  
+  get_summary <- function(ES_Preds){
+    ES_Preds %>%
+      dplyr::select(all_of(var_id), ID, Hold, Model) %>%
+      group_by(ID, Model) %>%
+      summarise(Mean_Response = mean(.data[[var_id]]), .groups = "drop") %>%
+      group_by(ID) %>%
+      summarise(Mean = mean(Mean_Response), .groups = "drop") %>%
+      cbind(Evaluation_Strip_Range)
+  }
+  
+  # Generate summaries for each species
+  GUR_df <- get_summary(GUR_ES) %>% mutate(Species = "GUR")
+  RUR_df <- get_summary(RUR_ES) %>% mutate(Species = "RUR")
+  PUR_df <- get_summary(PUR_ES) %>% mutate(Species = "PUR")
+  
+  # Combine all
+  Combined_ES <- bind_rows(GUR_df, RUR_df, PUR_df)
+  
+  # Generate the plot
+  p <- ggplot(Combined_ES, aes(x = .data[[var_id]], y = Mean, color = Species)) +
+    geom_smooth(method = "loess", se = TRUE, linewidth = 1.2, alpha = 0.2) +
+    scale_color_manual(
+      values = c("RUR" = "#e6360F", "GUR" = "#55C667FF", "PUR" = "#a503fc"),
+      labels = c("RUR" = "red", "GUR" = "green", "PUR" = "purple")
+    ) +
+    theme_cowplot() +
+    labs(x = var_name, y = "LO", color = "Species") +
+    theme(
+      axis.title = element_text(size = 18),
+      axis.text = element_text(size = 16)
+    )
+  
+  return(p)
+}
+
+#Generate individual plots
+Combined_ES_Plots <- list()
+for(i in seq_along(Predictor_IDs)){
+  plot_i <- ES_CompareSpeciesPlotter(GUR_ES_Preds, RUR_ES_Preds, PUR_ES_Preds,
+                                     Predictor_IDs[i], Predictor_Names[i])
+  Combined_ES_Plots[[i]] <- plot_i
+  
+  # Save individual plots
+  ggsave2(filename = paste0("./Plots/ES_Plots/Combined/ES_Compare_", Predictor_IDs[i], ".jpeg"),
+          plot = plot_i, scale = 1, height = 150, width = 225, units = "mm")
+}
+
+#Extract shared first legend
+shared_legend <- get_legend(
+  Combined_ES_Plots[[1]] +
+    theme(
+      legend.position = "right",
+      legend.text = element_text(size = 18),
+      legend.title = element_text(size = 20)
+    )
+)
+
+#Remove legends
+Combined_ES_Plots_no_legend <- lapply(Combined_ES_Plots, function(p) p + theme(legend.position = "none"))
+
+#Combine plots and legend in grid
+Combined_ES_Grid <- plot_grid(
+  plot_grid(plotlist = Combined_ES_Plots_no_legend, ncol = 5),
+  shared_legend,
+  rel_widths = c(1, 0.1)
+)
+
+#Save plots
+ggsave2(filename = "./Plots/ES_Plots/Combined_ES_Grid.jpeg",
+        plot = Combined_ES_Grid, scale = 1, height = 450, width = 520, units = "mm")
+
+```
+
+
+#density
+```{r}
+# Load both datasets
+density_GUR <- read.csv("./Generated_Data/ES_datasets/GUR_ES_Count.csv") %>%
+  mutate(species = "GUR")
+density_RUR <- read.csv("./Generated_Data/ES_datasets/RUR_ES_Count.csv") %>%
+  mutate(species = "RUR")
+
+# Combine datasets
+ggdat <- bind_rows(density_GUR, density_RUR)
+ggdat$id <- as.factor(ggdat$id)
+
+# Recode variable names
+recode_vars <- function(df) {
+  df %>%
+    mutate(
+      expl.var.factor = recode(expl.var.factor,
+                               "Current" = "Current (m/s)",
+                               "Slope" = "Slope (deg)",
+                               "Rock" = "Percent Rock (%)",
+                               "TAlk_10m_mean" = "Talkbmax (mEq/m³)",
+                               "salt_10m_min" = "Sbmin (PSU)",
+                               "temp_s_max" = "Tsmax (°C)",
+                               "temp_s_min" = "Tsmin (°C)",
+                               "temp_10m_mean" = "Tbmean (°C)",
+                               "temp_10m_min" = "Tbmin (°C)",
+                               "do_10m_mean" = "Oxybmean (mmol/m^3)",
+                               "do_10m_min" = "Oxybmin (mmol/m^3)",
+                               "Depth" = "Depth (m)"
+      ),
+      expl.name = expl.var.factor
+    )
+}
+
+ggdat <- recode_vars(ggdat)
+
+
+# Define oxygen variables
+oxy_vars <- c("Oxybmean (mmol/m^3)", "Oxybmin (mmol/m^3)")
+
+# Subset data
+ggdat_oxy <- ggdat %>% filter(expl.name %in% oxy_vars)
+ggdat_other <- ggdat %>% filter(!expl.name %in% oxy_vars)
+
+# Plot oxygen variables with y limits -200 to 200
+p_oxy <- ggplot(ggdat_oxy, aes(x = expl.val, y = pred.val, color = species)) +
+  geom_smooth(
+    aes(group = species),
+    method = "loess",
+    se = TRUE,
+    fill = "grey30",
+    size = 1.2,
+    alpha = 0.3
+  ) +
+  facet_wrap(~ expl.name, scales = "free_x") +
+  scale_color_manual(values = c("GUR" = "#55C667FF", "RUR" = "#e6360F")) +
+  coord_cartesian(ylim = c(-10, 50)) +
+  labs(
+    x = "",
+    y = "Urchin density (m²)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+# Plot other variables with y limits -4 to 10
+p_other <- ggplot(ggdat_other, aes(x = expl.val, y = pred.val, color = species)) +
+  geom_smooth(
+    aes(group = species),
+    method = "loess",
+    se = TRUE,
+    fill = "grey30",
+    size = 1.2,
+    alpha = 0.3
+  ) +
+  facet_wrap(~ expl.name, scales = "free_x") +
+  scale_color_manual(values = c("GUR" = "#55C667FF", "RUR" = "#e6360F")) +
+  coord_cartesian(ylim = c(-4, 10)) +
+  labs(
+    x = "Explanatory Variable",
+    y = "Urchin density (m²)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+# Combine with patchwork, sharing the legend and stacking vertically
+combined_plot <- p_oxy / p_other + plot_layout(guides = "collect")
+
+# Print combined plot
+print(combined_plot)
+
+
+ggsave("./Plots/ES_Plots/GUR_RUR_ES_Count_Combined.png", plot = combined_plot, width = 8, height = 10, dpi = 300)
+
+```
+
+
+#Ordinal 
+```{r}
+# Load both datasets
+ord_GUR <- read.csv("./Generated_Data/ES_datasets/GUR_ES_Ordinal.csv") %>%
+  mutate(species = "GUR")
+ord_RUR <- read.csv("./Generated_Data/ES_datasets/RUR_ES_Ordinal.csv") %>%
+  mutate(species = "RUR")
+
+# Combine datasets
+ggdat <- bind_rows(ord_GUR, ord_RUR)
+ggdat$id <- as.factor(ggdat$id)
+
+# Recode variable names
+recode_vars <- function(df) {
+  df %>%
+    mutate(
+      expl.var.factor = recode(expl.var.factor,
+                               "Current" = "Current (m/s)",
+                               "Slope" = "Slope (deg)",
+                               "Rock" = "Percent Rock",
+                               "TAlk_10m_mean" = "Talkbmax (mEq/m³)",
+                               "salt_10m_min" = "Sbmin (PSU)",
+                               "temp_s_max" = "Tsmax (°C)",
+                               "temp_s_min" = "Tsmin (°C)",
+                               "temp_10m_mean" = "Tbmean (°C)",
+                               "temp_10m_min" = "Tbmin (°C)",
+                               "do_10m_mean" = "Oxybmean (mmol/m^3)",
+                               "do_10m_min" = "Oxybmin (mmol/m^3)",
+                               "Depth" = "Depth (m)"
+      ),
+      expl.name = expl.var.factor
+    )
+}
+
+ggdat <- recode_vars(ggdat)
+
+
+# Define oxygen variables
+oxy_vars <- c("Oxybmean (mmol/m^3)", "Oxybmin (mmol/m^3 )")
+
+# Subset data
+ggdat_oxy <- ggdat %>% filter(expl.name %in% oxy_vars)
+ggdat_other <- ggdat %>% filter(!expl.name %in% oxy_vars)
+
+# Plot oxygen variables with y limits -200 to 200
+p_oxy <- ggplot(ggdat_oxy, aes(x = expl.val, y = pred.val, color = species)) +
+  geom_smooth(
+    aes(group = species),
+    method = "loess",
+    se = TRUE,
+    fill = "grey30",
+    size = 1.2,
+    alpha = 0.3
+  ) +
+  facet_wrap(~ expl.name, scales = "free_x") +
+  scale_color_manual(values = c("GUR" = "#55C667FF", "RUR" = "#e6360F")) +
+  coord_cartesian(ylim = c(-200, 200)) +
+  labs(
+    x = "",
+    y = "Relative Abundance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+# Plot other variables with y limits -4 to 10
+p_other <- ggplot(ggdat_other, aes(x = expl.val, y = pred.val, color = species)) +
+  geom_smooth(
+    aes(group = species),
+    method = "loess",
+    se = TRUE,
+    fill = "grey30",
+    size = 1.2,
+    alpha = 0.3
+  ) +
+  facet_wrap(~ expl.name, scales = "free_x") +
+  scale_color_manual(values = c("GUR" = "#55C667FF", "RUR" = "#e6360F")) +
+  coord_cartesian(ylim = c(-4, 10)) +
+  labs(
+    x = "Explanatory Variable",
+    y = "Urchin Relative Abundance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+# Combine with patchwork, sharing the legend and stacking vertically
+combined_plot <- p_oxy / p_other + plot_layout(guides = "collect")
+
+# Print combined plot
+print(combined_plot)
+
+
+```
+#all on same graph
+```{r}
+plot <- ggplot(ggdat, aes(x = expl.val, y = pred.val, color = species)) +
+  geom_smooth(
+    aes(group = species),
+    method = "loess",
+    se = TRUE,
+    fill = "grey30",
+    size = 1.2,
+    alpha = 0.3
+  ) +
+  facet_wrap(~ expl.name, scales = "free_x") +
+  scale_color_manual(values = c("GUR" = "#55C667FF", "RUR" = "#e6360F")) +
+  #coord_cartesian(ylim = c(1, 4)) +
+  labs(
+    x = "",
+    y = "Urchin Relative Abundance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid = element_blank()
+  )
+
+plot
+
+ggsave("./Plots/ES_Plots/GUR_RUR_ES_Ordinal_Combined.png", plot = plot, width = 10, height = 15, dpi = 300)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

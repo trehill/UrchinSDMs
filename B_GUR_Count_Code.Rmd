@@ -1,0 +1,1416 @@
+---
+title: "Green_Urchin_Count_Models"
+author: "Tessa Rehill"
+date: "2025-04-08"
+output: html_document
+---
+
+This script runs abundance models for green urchin using biomod2 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load necessary packages 
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(terra)
+library(sf)
+library(ggspatial)
+library(cowplot)
+library(biomod2)
+library(ggtext)
+library(usdm)
+library(gridExtra)
+library(ggsci)
+library(patchwork)
+library(blockCV)
+
+```
+
+#Call necessary functions 
+```{r}
+source("Count_Mapping_Functions.R")
+source("CV_Functions_flexSDM.R")
+
+```
+
+#Creating count dataset
+```{r}
+#Import the mask which will be important for masking any unmasked data at this point
+BC_Mask <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project("epsg:3005")
+
+#Import the shapefile we will be using to represent land/the coastline and project to the correct crs/mask to NC
+Coastline <- vect("./raw_data/BC_Buffer/GSHHS_f_L1.shp") %>% terra::project("epsg:3005")
+Land <- Coastline %>% terra::mask(BC_Mask)
+
+
+#Load in the prepped Count data 
+Urchin_Transects_Filtered <- sf::st_read("./processed_data/Urchin_Count/Urchin_Count_Transects_Filtered.shp")
+```
+
+#Create green urchin shapefiles 
+```{r}
+
+selected_species <- "GUR"
+
+filtered_data <- Urchin_Transects_Filtered %>% filter(species == selected_species)
+
+GUR_Year_list <- unique((filtered_data %>% dplyr::filter(species == selected_species))$year)
+
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#For each year in the GUR year list generate Count points, a Count raster, and a map of where Counts were observed
+for (i in 1:length(GUR_Year_list)){
+  Shapefile_Output <- Shapefile_Creator(filtered_data %>% dplyr::filter(year == GUR_Year_list[i]), Bathymetry, selected_species)
+  terra::writeVector(Shapefile_Output, paste0("./processed_data/Urchin_Count/GUR_Count_Points", GUR_Year_list[i],".shp"), overwrite = TRUE)
+}
+
+```
+
+
+## Create the final count dataset for GUR
+```{r}
+GUR_Year_list <- unique((Urchin_Transects_Filtered %>% dplyr::filter(species == "GUR"))$year)
+
+#For each year in the GUR year list generate Count points, a Count raster, and a map of where Counts were observed
+for (i in 1:length(GUR_Year_list)){
+  GUR_Output <- Point_Creator(Urchin_Transects_Filtered %>% dplyr::filter(year == GUR_Year_list[i]), "GUR", Bathymetry)
+  GUR_Count_Points <- GUR_Output[[2]]
+  GUR_Raster <- GUR_Output[[1]]
+  terra::writeVector(GUR_Count_Points, paste0("./processed_data/Urchin_Count/GUR_AD_Points_", GUR_Year_list[i],".shp"), overwrite = TRUE)
+  terra::writeRaster(GUR_Raster, paste0("./processed_data/Urchin_Count/GUR_AD_Raster_", GUR_Year_list[i], ".tif"), overwrite = TRUE)
+  GUR_Pres_Map <- Pres_Map(Land, GUR_Count_Points %>% terra::project(crs(Land)))
+  ggsave(paste0("./Plots/Maps/Species_Count_Maps/GUR_AD_Map_", GUR_Year_list[i], ".jpeg"), GUR_Pres_Map, units = "mm", width = 120, height = 140)
+}
+
+#Do the same for the entire time period 
+GUR_Output <- Point_Creator(Urchin_Transects_Filtered, "GUR", Bathymetry)
+GUR_Count_Points <- GUR_Output[[2]]
+GUR_Raster <- GUR_Output[[1]]
+terra::writeVector(GUR_Count_Points, "./processed_data/Urchin_Count/GUR_AD_Points.shp", overwrite = TRUE)
+terra::writeRaster(GUR_Raster, "./processed_data/Urchin_Count/GUR_AD_Raster.tif", overwrite = TRUE)
+
+GUR_Count_Points <- terra::vect("./processed_data/Urchin_Count/GUR_AD_Points.shp")
+GUR_Pres_Map <- Pres_Map(Land, GUR_Count_Points %>% terra::project(crs(Land)))
+
+ggsave("./Plots/Maps/Species_Count_Maps/GUR_AD_Map.jpeg", GUR_Pres_Map, units = "mm", width = 120, height = 140)
+```
+
+
+#BIOMOD PIPELINE 
+#current v10 
+
+##load data specifically for Alliance running
+```{r}
+#Load in data (for Alliance pipeline)
+Land <- terra::vect("./raw_data/BC_Buffer/Land.shp") 
+```
+
+#Format data to make dataframe of density points per year per environment 
+```{r}
+Urchin_Transects_Filtered <- sf::st_read("./processed_data/Urchin_Count/Urchin_Count_Transects_Filtered.shp")
+colnames(Urchin_Transects_Filtered)[4] <- "Year"
+colnames(Urchin_Transects_Filtered)[11] <- "Species"
+
+
+GUR_Transects <- terra::subset(Urchin_Transects_Filtered, Species == "GUR")
+GUR_Year_list <- unique(GUR_Transects$Year)
+
+#Plot densities in a map 
+
+#Set up dataframes to hold 
+resp_df <- data.frame(mean = numeric())
+env_df <- data.frame(
+  ID = numeric(),
+  TAlk_10m_mean = numeric(),
+  salt_10m_mean = numeric(),
+  salt_10m_min = numeric(),
+  temp_s_mean = numeric(),
+  temp_s_max = numeric(),
+  temp_s_min = numeric(),
+  temp_10m_mean = numeric(),
+  temp_10m_max = numeric(),
+  temp_10m_min = numeric(),
+  do_10m_mean = numeric(),
+  do_10m_min = numeric(),
+  Current = numeric(),
+  REI = numeric(),
+  Rock = numeric(),
+  Slope = numeric(),
+  Depth = numeric()
+)
+
+
+#Create an empty data frame to store x,y
+xy <- data.frame(
+  x = numeric(),
+  y = numeric()
+)
+
+
+for (i in 1:length(GUR_Year_list)){
+  #Load the environmental layers for year i
+  env.var <- terra::rast(paste0("./processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", GUR_Year_list[i], ".tif"))
+  
+  #Load shapefile for year i 
+  resp.var <- terra::vect(paste0("./processed_data/Urchin_Count/GUR_Count_Points", GUR_Year_list[i], ".shp"))
+  
+  #Rasterize shapefile, using env raster, take average density
+  resp_raster <- terra::rasterize(resp.var, env.var, field = "density", fun = "mean") #average density per cell, creates raster
+  
+  #Resample shapefile, to env raster
+  resp_raster <- terra::resample(resp_raster, env.var) #align resolutions and extents to environmental raster
+  
+  #Convert raster to point (using as.points) 
+  points <- terra::as.points(resp_raster) #now each point has a location and averaged density value 
+  points_df <- as.data.frame(points)
+  
+  
+  #Extract coordinates of shapefile (using geom)
+  coordinates <- terra::geom(points, df=TRUE) %>% dplyr::select(x, y)
+  
+  #Extract environmental variables for these coordinates 
+  env_values <- terra::extract(env.var, points)
+  
+  #Append points_df to resp_df
+  resp_df <- rbind(resp_df, points_df)
+  
+  #Append env_values to env_df
+  env_df <- rbind(env_df, env_values)
+  
+  #Append coordinate to xy dataframe using rbind
+  xy <- rbind(xy, coordinates)
+}
+
+
+#create full training dataframe 
+print("Finished: Create dataframes BY year")
+
+```
+
+#Plot count dataset 
+```{r}
+
+Land <- terra::vect("./raw_data/BC_Buffer/Land.shp") 
+ # Convert land to sf
+  land_sf <- st_as_sf(Land)
+  
+map_df <- cbind(resp_df, xy) %>%
+  filter(mean < 100)
+
+
+GUR_Count_Map <- ggplot() +    
+  geom_sf(data = land_sf, fill = "grey80", color = NA) + 
+  geom_point(data = map_df, aes(x = x, y = y, size = mean, alpha = mean), color = "#55C667FF") + 
+  scale_size_continuous(range = c(.1, 1.5), name = "Mean Density (m²)") + 
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "Mean Density (m²)") + 
+  annotation_scale(location = "bl", width_hint = 0.5) + 
+  annotation_north_arrow(location = "bl", which_north = "true",
+                         pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+                         style = north_arrow_fancy_orienteering) +    
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +    
+  theme_cowplot() +    
+  xlab(NULL) +    
+  ylab(NULL) +    
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  )
+
+GUR_Count_Map
+
+ggsave(
+  filename = "./processed_data/Urchin_Count/GUR_CountDataset_Map.png",   # or another path/filename
+  plot = GUR_Count_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+```
+
+#Remove collinear environmental variables
+```{r}
+env_df <- env_df[, !(colnames(env_df) %in% c("ID"))]
+
+predictors <- env_df %>% na.omit()
+varCor <- cor(predictors, use = "na.or.complete")
+corrplot::corrplot(varCor)
+Corr_Plot <- recordPlot()
+
+
+#identify collinear/correlated variables and exclude them 
+vif <- vifstep(env_df, th = 10, method = 'pearson') #checks collinearity based on VIF 
+vif
+#4 variables from 15 have collinearity problems (do_10m_mean, temp_s_mean ,temp_10m_max, salt_10m_min)
+
+env_df <- env_df[, !(colnames(env_df) %in% c("temp_s_mean", "salt_10m_mean", "temp_10m_max"))] 
+
+#exclude these variables from our raster 
+#env_df <- exclude(env_df, vif)
+
+cor <- vifcor(env_df, th=0.7, method = 'pearson') #identify corelated variables
+cor
+
+#no problems with correlation
+
+#new_expl <- exclude(new_expl, cor) 
+
+summary(env_df)
+names(env_df)
+
+#Read in projection layers, and remove the same variables
+
+proj.var <- rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2018-2023.tif") 
+
+proj.var <- proj.var[[!names(proj.var) %in% c("temp_s_mean", "temp_10m_max", "salt_10m_mean")]] #remove same variables
+
+names(proj.var)
+
+
+print("Finished: Running collinearity") 
+
+```
+
+#Create final dataset (of all data) 
+```{r}
+#Create final training dataset
+GUR_training_data <- cbind(xy, resp_df, env_df)  %>% na.omit() #includes all data 
+
+
+#Create evaluation dataset using blockCV
+
+#Set the size of spatial blocks based on previously completed autocorrelation analysis
+Block_Size <-90000  #CODEEDIT to adjust block size for the species if needed 
+#Set the k-value for k-fold cross-validation: number of spatial folds
+k <- 10
+
+#Load in hindcast climatology #CODEEDIT select for only the variables I want included in my models
+Hindcast_Climatology <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif")
+
+Hindcast_Climatology <- terra::subset(Hindcast_Climatology, names(Hindcast_Climatology) != c("temp_s_mean", "salt_10m_mean", "temp_10m_max"))
+
+#Turn the final training dataset into an sf object
+GUR_training_data_sf <- sf::st_as_sf(GUR_training_data, coords = c("x", "y"), crs = 3005)
+
+#Set seed
+set.seed(157)
+#Spatially block based on the optimal size suggested above
+GUR_training_blocks <- blockCV::cv_spatial(GUR_training_data_sf, column = "mean", hexagon = FALSE, k = k+1, size = Block_Size, selection = "random", iteration = 200)
+
+GUR_training_data$fold <- GUR_training_blocks$folds_ids
+GUR_training_data_sf$fold <- GUR_training_blocks$folds_ids
+
+#Check to see how many  points ended up in each block
+Point_summary <- terra::as.data.frame(GUR_training_data) %>%
+  dplyr::group_by(fold) %>%
+  dplyr::summarise(Point_num = dplyr::n())
+
+#write.csv(Point_summary, "./Generated_Data/Interim_datasets/GURcount_point_summary.csv")
+
+Point_summary <-GUR_training_data %>%
+  group_by(fold, mean) %>%
+  summarise(count = n()) %>%
+  arrange(fold, desc(mean))
+
+# Categorize the mean values
+plot_data <- GUR_training_data %>%
+  mutate(mean_cat = case_when(
+    mean == 0 ~ "none",
+    mean > 0 & mean <= 10 ~ "few",
+    mean > 10 & mean <= 20 ~ "many",
+    mean > 20 ~ "abundant"
+  )) %>%
+  group_by(fold, mean_cat) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Plot
+plot <- ggplot(plot_data, aes(x = factor(fold), y = count, fill = mean_cat)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Fold", y = "Count", fill = "Abundance Category",
+       title = "Abundance Categories per Fold") +
+  scale_fill_manual(values = c("none" = "grey70", "few" = "lightblue", "many" = "orange", "abundant" = "darkred")) +
+  theme_minimal()
+
+plot
+
+#ggsave("./Plots/Count_models/GURcount_point_summary.png", width = 8, height = 6, dpi = 300)
+
+#Adjust folds if needed by reshuffling presence points from folds with a number of presence points over some cutoff based on the total number of points in the dataset
+#GUR_training_data_sf <- CV_redistribute_count(GUR_training_data_sf, k+1, 80) #adjust this cutoff to be reasonable based on the number of presence points and folds you are working with (the idea is to better balance presences within folds, but not to make things completely equal)
+
+GUR_training_data_vec <- terra::vect(GUR_training_data_sf)
+GUR_training_data_df <- terra::as.data.frame(GUR_training_data)
+
+#Save the dataset for GUR
+#write.csv(GUR_training_data_df, "./Generated_Data/Blocked_datasets/GURcount_blocks.csv")
+terra::writeVector(GUR_training_data_vec, "./processed_data/Blocked_Spatial_Data/GURcount_blocks.shp", overwrite = TRUE)
+
+
+
+print("Finished: Evaluation Dataset Set Up")
+
+```
+
+#Create final training and evaluation dataset
+```{r}
+#Create a final training df from the first k folds
+GUR_training_df <- GUR_training_data_df %>% dplyr::filter(fold != (k+1))
+
+train_resp_df <- GUR_training_df$mean
+train_xy <- GUR_training_df %>% dplyr::select(x, y)
+train_env <- GUR_training_df %>% dplyr::select(TAlk_10m_mean, salt_10m_min, temp_s_max, temp_s_min, temp_10m_mean, temp_10m_min, do_10m_mean, do_10m_min, Current, REI, Rock, Slope, Depth)
+
+#Create a final evaluation df from the K+1 fold
+GUR_evaluation_df <- GUR_training_data_df %>% dplyr::filter(fold == (k+1))
+
+eval_resp_df <- GUR_evaluation_df$mean
+eval_xy <- GUR_evaluation_df %>% dplyr::select(x, y)
+eval_env <- GUR_evaluation_df %>% dplyr::select(TAlk_10m_mean, salt_10m_min, temp_s_max, temp_s_min, temp_10m_mean, temp_10m_min, do_10m_mean, do_10m_min, Current, REI, Rock, Slope, Depth)
+
+print("Finished: Creating final training and evaluation datasets")
+```
+
+#Format data with biomod2
+```{r}
+#define species to model (ch)
+sp <- c('GUR')
+
+#define models to run 
+all_models <- c("GLM","GBM", "RF", "XGBOOST" ) #no GBM for ordinal data, no MAXENT for any abundance
+
+#format
+myBiomodData <- BIOMOD_FormatingData(resp.var = train_resp_df, #as SpatVector without associated data, for a single species
+                                     expl.var = train_env, #SpatRaster containing explanatory variables in layers
+                                     resp.name = sp, #character corresponding to species name
+                                     resp.xy = train_xy, #if resp.var is vector, 2 column matrix associated xy coordinates
+                                     dir.name = c('./models_biomod/count'), 
+                                     data.type = c("abundance"), #can also be 'ordinal'
+                                     eval.expl.var = eval_env, #SpatRaster without associated data, independent data to evaluate
+                                     eval.resp.var = eval_resp_df, #SpatVector without associated data, independent data to evaluate 
+                                     eval.resp.xy = eval_xy, #if resp.vect is vector, 2 column matrix of xy coordinates
+                                     na.rm = TRUE, 
+                                     filter.raster = TRUE, #filter points in same cell
+                                     seed.val = 1234
+) 
+
+
+print("Finished: BIOMOD formatting data function")
+```
+
+#Cross validation - using this cv strategy
+```{r}
+cv <- bm_CrossValidation(bm.format = myBiomodData,
+                         strategy = "kfold", #options are random, k-fold, strat, block, env, or user-defined
+                         nb.rep = 1, #integer, number of repetitions of CV points to be drawn 
+                         k = 10, #number of partitions                                         
+                         do.full.models = TRUE #calibrated and validated over the whole dataset (and pseudo-absence datasets) or not
+) 
+
+print("Finished: CV fold")
+
+```
+
+#Model tuning
+```{r}
+#Tuning models and setting model options
+opt.d <- bm_ModelingOptions(data.type = 'abundance', #character corresponding to data type to be used (see below)
+                            models = all_models,
+                            strategy = 'default',
+                            bm.format = myBiomodData)
+
+#boosted regression tree tuning 
+tuned.gbm <- bm_Tuning(model = "GBM",
+                       tuning.fun= c("gbm"),
+                       bm.options = opt.d@options$GBM.abundance.gbm.gbm,
+                       do.formula = TRUE,
+                       bm.format = myBiomodData,   
+                       #calib.lines = cv,
+                       metric.eval = c("Rsquared"), 
+                       params.train = list(GBM.n.trees = c(3000, 4000),
+                                           GBM.interaction.depth = c(1, 2), 
+                                           GBM.shrinkage = c(0.01, 0.05, 0.1),
+                                           GBM.n.minobsinnode = c(10, 20, 30 ))
+)
+
+print("Finished: GBM tuning")
+
+#tuning GAM model 
+#tuned.gam <- bm_Tuning(model = 'GAM',
+#                       tuning.fun = 'gam', ## see in ModelsTable
+#                       do.formula = TRUE,
+#                       bm.options = opt.d@options$GAM.abundance.mgcv.gam,
+#                       bm.format = myBiomodData,
+#                       metric.eval=c("Rsquared"),
+                       #calib.lines = cv,
+#                       params.train = list(GAM.select =c('TRUE'), GAM.method = c('GCV.Cp'), GAM.knots=c(3)))
+
+print("Finished: GAM tuning")
+
+#Tuning CTA
+#tuned.cta <- bm_Tuning(model = 'CTA',
+#                        tuning.fun = 'rpart', ## see in ModelsTable
+#                        do.formula = TRUE,
+#                        bm.options = opt.d@options$CTA.abundance.rpart.rpart,
+#                        bm.format = myBiomodData,
+#                        metric.eval=c("Rsquared"),
+                        #calib.lines = cv,
+#                        params.train = list(CTA.maxdepth =c(5,10,20)))
+
+#print("Finished: CTA tuning")
+
+
+#Tuning RF
+tuned.rf <- bm_Tuning(
+  model = 'RF',
+  tuning.fun = 'rf',
+  do.formula = TRUE, #not sure if this should be true?, when run true = throws error, also TRUE = slower
+  bm.options = opt.d@options$RF.abundance.randomForest.randomForest, #should be an object returned bybm_ModellingOptions,
+  bm.format = myBiomodData, 
+  #calib.lines = cv,
+  metric.eval = c("Rsquared"), #Recall, Precision, and F1
+  params.train = list(RF.mtry=c(2, 3, 4, 5))
+)
+
+print("Finished: RF tuning")
+
+#Tuning XGBOOST 
+tuned.xgboost <- bm_Tuning(
+  model = 'XGBOOST',
+  tuning.fun = 'xgbTree',
+  do.formula = TRUE, #not sure if this should be true?, when run true = throws error, also TRUE = slower
+  bm.options = opt.d@options$XGBOOST.abundance.xgboost.xgboost, #should be an object returned bybm_ModellingOptions,
+  bm.format = myBiomodData, 
+  #calib.lines = cv,
+  metric.eval = c("Rsquared"), #Recall, Precision, and F1
+  params.train = list(XGBOOST.nrounds = c(3,4,5), XGBOOST.max_depth =c(2,3,4), XGBOOST.eta =c(0.01,0.01, 1), XGBOOST.gamma=c(0,0.1)))
+
+#increase gamma if you're seeing overfitting
+#can also change colsample_bytree - fraction of features used per tree, lower = better for overfitting
+#subsample - fraction of rows used per tree, prevents overfitting
+
+print("Finished: XGBOOST tuning")
+
+#tuned.mars <- bm_Tuning(
+#  model = 'MARS',
+#  tuning.fun = 'earth',
+#  do.formula = TRUE, #not sure if this should be true?, when run true = throws error, also TRUE = slower
+#  bm.options = opt.d@options$MARS.abundance.earth.earth, #should be an object returned bybm_ModellingOptions,
+#  bm.format = myBiomodData, 
+  #calib.lines = cv,
+#  metric.eval = c("Rsquared"), #Recall, Precision, and F1
+#  params.train = list(MARS.degree = c(1,2), MARS.nprune =c(20,30,40)))
+
+#increase gamma if you're seeing overfitting
+#can also change colsample_bytree - fraction of features used per tree, lower = better for overfitting
+#subsample - fraction of rows used per tree, prevents overfitting
+
+#print("Finished: MARS tuning")
+
+
+
+#Setting tuning options
+opt.t <- bm_ModelingOptions(data.type = 'abundance',
+                            models = all_models,
+                            strategy = "user.defined",
+                            user.val = list(#GAM.nonbinary.mgcv.gam = tuned.gam,
+                                            GBM.abundance.gbm.gbm = tuned.gbm, 
+                                            RF.abundance.randomForest.randomForest = tuned.rf,
+                                            #MARS.nonbinary.earth.earth=tuned.mars,
+                                            #CTA.nonbinary.rpart.rpart=tuned.cta,
+                                            XGBOOST.abundance.xgboost.xgboost = tuned.xgboost ),
+                            user.base = "bigboss",
+                            bm.format = myBiomodData,
+                            calib.lines = cv)
+
+names(opt.t@options)
+
+print("Finished: Modeling Options")
+```
+
+#Model species 
+```{r}
+mod_id <- c('GUR')
+myBiomodModelOut <- BIOMOD_Modeling(bm.format = myBiomodData,
+                                    modeling.id = mod_id,
+                                    models = all_models,
+                                    CV.strategy = "user.defined",
+                                    CV.user.table = cv,
+                                    OPT.strategy = "user-defined",
+                                    OPT.user = opt.t,
+                                    metric.eval = c("MAE", "Rsquared"),
+                                    var.import = 100,
+                                    seed.val = 42,
+                                    nb.cpu = 14)
+
+
+#for ordinal data this includes: Accuracy, Recall, Precision and F1 
+print("Finished: Modeling (out)")
+```
+
+#Single model evaluation scores (and saving)
+```{r}
+eval <- get_evaluations(myBiomodModelOut)
+
+summary(eval)
+
+#write.csv(eval, "./Generated_Data/Evaluation_datasets/Count/GUR/single_model_scores.csv", row.names = FALSE)
+
+var <- get_variables_importance(myBiomodModelOut)
+
+summary(var)
+
+#write.csv(var, "./Generated_Data/Evaluation_datasets/Count/GUR/count_single_variable_importance.csv", row.names = FALSE)
+
+print("Finished: Saving single model metrics")
+
+single_models <- myBiomodModelOut
+```
+
+#Graph single model evaluation scores
+
+```{r}
+#model scores plot 1
+plot_output <-  bm_PlotEvalMean(bm.out = myBiomodModelOut) 
+summary(plot_output)
+
+ggdat <- plot_output$tab
+summary(ggdat)
+
+
+names(ggdat) <- c('algo', 'MAE_mean','Rsquared_mean', 'MAE_sd', "Rsquared_sd") 
+ggdat$algo <- as.factor(ggdat$algo)
+
+gg1 <-ggplot(ggdat, aes(x = MAE_mean, y = Rsquared_mean, color = algo)) + 
+  geom_point() + 
+  geom_errorbarh(aes(xmax = MAE_mean + MAE_sd, xmin = MAE_mean - MAE_sd),height=0)+ 
+  geom_linerange(aes(ymax= Rsquared_mean + Rsquared_sd, ymin=Rsquared_mean - Rsquared_sd)) +
+  theme_bw()+ theme(legend.title = element_blank(), 
+                    legend.key = element_rect(fill = "white"), 
+                    legend.position = "bottom",
+                    axis.text.x = element_text(angle = 45, hjust = 1))+ 
+  theme_classic() + xlab("MAE")+ ylab("Rsquared") +
+  ggtitle(paste0("Comparison of model calibration metrics for ", sp," models" ))+
+  scale_color_npg() 
+
+
+gg1
+
+# Save the plot
+output_path <- file.path("./Plots/Eval_Plots/Count/GUR_mean_model_scores.png")
+#ggsave(output_path, plot = gg1, width = 8, height = 6, dpi = 300)
+
+
+#model scores plot 2
+plot_output <- bm_PlotEvalBoxplot(bm.out = myBiomodModelOut, group.by = c('algo', 'algo'))
+ggdat <- plot_output$tab
+MAE_data <- ggdat %>% filter(metric.eval == "MAE")
+rsq_data <- ggdat %>% filter(metric.eval == "Rsquared")
+
+# Create MAE calibration plot
+gg_MAE_cal <- ggplot(MAE_data, aes(y = calibration, x = algo, color = algo, fill = algo)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  ylab("MAE (Calibration)") +
+  xlab("Algorithm") +
+  scale_color_npg() +
+  scale_fill_npg() +
+  ggtitle(paste0("MAE Calibration Metrics for ", sp, " Models"))
+
+# Create R-squared calibration plot with y-axis from 0 to 1
+gg_rsq_cal <- ggplot(rsq_data, aes(y = calibration, x = algo, color = algo, fill = algo)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  ylab("R-squared (Calibration)") +
+  xlab("Algorithm") +
+  ylim(0, 1) +
+  scale_color_npg() +
+  scale_fill_npg() +
+  ggtitle(paste0("R-squared Calibration Metrics for ", sp, " Models"))
+
+# Create MAE validation plot
+gg_MAE_val <- ggplot(MAE_data, aes(y = validation, x = algo, color = algo, fill = algo)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  ylab("MAE (Validation)") +
+  xlab("Algorithm") +
+  scale_color_npg() +
+  scale_fill_npg() +
+  ggtitle(paste0("MAE Validation Metrics for ", sp, " Models"))
+
+# Create R-squared validation plot with y-axis from 0 to 1
+gg_rsq_val <- ggplot(rsq_data, aes(y = validation, x = algo, color = algo, fill = algo)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  ) +
+  ylab("R-squared (Validation)") +
+  xlab("Algorithm") +
+  ylim(0, 1) +
+  scale_color_npg() +
+  scale_fill_npg() +
+  ggtitle(paste0("R-squared Validation Metrics for ", sp, " Models"))
+
+gg_MAE_ev <- ggplot(MAE_data, aes(y = evaluation, x = algo, color = algo, fill = algo)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  ylab("MAE (Evaluation)") +
+  xlab("Algorithm") +
+  scale_color_npg() +
+  scale_fill_npg() +
+  ggtitle(paste0("MAE Evaluation Metrics for ", sp, " Models"))
+
+# Create R-squared validation plot with y-axis from 0 to 1
+gg_rsq_ev <- ggplot(rsq_data, aes(y = evaluation, x = algo, color = algo, fill = algo)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  ) +
+  ylab("R-squared (Evaluation)") +
+  xlab("Algorithm") +
+  ylim(0, 1) +
+  scale_color_npg() +
+  scale_fill_npg() +
+  ggtitle(paste0("R-squared Evaluation Metrics for ", sp, " Models"))
+
+# Combine all four plots into one figure
+gg2 <- grid.arrange(gg_MAE_cal, gg_rsq_cal, gg_MAE_val, gg_rsq_val, gg_MAE_ev, gg_rsq_ev, ncol = 2, nrow = 3)
+
+gg2
+
+# Save the combined plot
+output_path <- file.path("./Plots/Eval_Plots/Count/GURcombined_boxplot_model_scores.png")
+#ggsave(output_path, plot = gg2, width = 12, height = 10, dpi = 300)
+
+#variable importance 
+
+plot_output <- bm_PlotVarImpBoxplot(bm.out = myBiomodModelOut, group.by = c('expl.var', 'algo', 'algo')) 
+ggdat <- plot_output$tab
+ggdat <- ggdat %>%
+  dplyr::mutate(expl.var.factor=as.factor(expl.var))%>%
+  group_by(expl.var.factor,algo)%>%
+  dplyr::summarize(mean = mean(var.imp),SD=sd(x=var.imp,na.rm=TRUE),N=sum(var.imp),SE= SD/sqrt(N))
+
+gg3 <-ggplot(ggdat, aes(y = mean, x = reorder(expl.var.factor, -mean), color = algo, fill= algo)) + 
+  geom_bar(position = "dodge",stat="identity") +
+  geom_errorbar(aes(ymax=mean + SE, ymin = mean - SE),position="dodge",stat="identity",color="grey10")+
+  ylim(-0.05,1)+
+  theme_classic() + 
+  theme(legend.title = element_blank(), 
+        legend.key = element_rect(fill = "white"), 
+        axis.text.x = element_text(angle = 45, hjust = 1), 
+        legend.position = "bottom") + 
+  ylab("Variable Importance")+ 
+  xlab("Calibration")+ scale_color_npg()+ scale_fill_npg()+
+  ggtitle(paste0("Variable importance for ", sp," models" ))
+gg3 <- grid.arrange(gg3)
+
+gg3
+
+# Save the plot
+output_path <- file.path("./Plots/Eval_Plots/Count/GUR_variable_importance.png")
+#ggsave(output_path, plot = gg3, width = 8, height = 6, dpi = 300)
+
+#response curves 
+# Get response data
+plot_output <- bm_PlotResponseCurves(
+  bm.out = myBiomodModelOut,
+  models.chosen = "all",
+  fixed.var = 'mean',
+  do.bivariate = FALSE,
+  do.plot = FALSE,
+  do.progress = FALSE
+)
+
+ggdat <- plot_output$tab %>%
+  dplyr::mutate(expl.var.factor = as.factor(expl.name))
+
+#write.csv(ggdat, "./Generated_Data/ES_datasets/GUR_ES_Count_single.csv", row.names = FALSE)
+
+# Assign algorithm labels based on prediction name
+ggdat$algo <- ifelse(grepl("_GLM", ggdat$pred.name, ignore.case = TRUE), "GLM",
+                     ifelse(grepl("_GBM", ggdat$pred.name, ignore.case = TRUE), "BRT",
+                            ifelse(grepl("_RF", ggdat$pred.name, ignore.case = TRUE), "RF",
+                                   ifelse(grepl("_CTA", ggdat$pred.name, ignore.case = TRUE), "CTA",
+                                          ifelse(grepl("_MARS", ggdat$pred.name, ignore.case = TRUE), "MARS",
+                                                 ifelse(grepl("_XGBOOST", ggdat$pred.name, ignore.case = TRUE), "XGBOOST",
+                                                 ifelse(grepl("_GAM", ggdat$pred.name, ignore.case = TRUE), "GAM", "NA")))))))
+
+
+ggdat$algo <- as.factor(ggdat$algo)
+ggdat$id <- as.factor(ggdat$id)
+
+# Set custom colors
+algo_colors <- c(
+  "BRT" = "#FDE725FF",
+  "GAM" = "#EAD7D1",
+  "GLM" = "#238A8DFF",
+  "MARS"= "red",
+  "RF"= "blue",
+  "CTA"="purple",
+  "XGBOOST"="green",
+  "Ensemble" = "#301934"
+)
+
+# Plot
+gg4 <- ggplot(ggdat, aes(x = expl.val, y = pred.val, color = algo)) +
+  geom_smooth(aes(group = algo), fill = "grey30", se = TRUE, method = "loess", alpha = 0.01) +  # By algorithm
+  geom_smooth(color = algo_colors["Ensemble"], fill = "grey30", se = TRUE, method = "loess") + # Ensemble line
+  facet_wrap(~ expl.var.factor, scales = "free_x") +
+  xlab("Predictor Variable") +
+  ylab("Prob. of Density") +
+  ggtitle(paste0("Response curves for ", sp, " models")) +
+  theme_classic() +
+  theme(
+    legend.title = element_blank(),
+    legend.key = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_color_manual(values = algo_colors)
+
+# Arrange and save
+gg4 <- grid.arrange(gg4)
+
+output_path <- file.path("./Plots/ES_Plots/GUR_response_curves.png")
+#ggsave(output_path, plot = gg4, width = 8, height = 6, dpi = 300)
+
+print("Finished: Graphing single model scores")
+```
+
+#Build ensemble models
+```{r}
+EnsembleModelsOut <- BIOMOD_EnsembleModeling(bm.mod= myBiomodModelOut,
+                                             models.chosen = 'all', #define models kept, can exclude models here
+                                             em.by='all', #chr, way kept models are combined to build ensemble models, see below 
+                                             em.algo = c('EMwmean'), #weighted mean by the evaluation metric 
+                                             metric.select = c('Rsquared'), #metric select and threshold determines which single models to keep 
+                                             metric.select.thresh = c(0.2),
+                                             metric.eval= c('Rsquared'),
+                                             metric.select.dataset = c('evaluation'),
+                                             EMci.alpha = 0.05, #num, significance level to estimate confidence interval
+                                             EMwmean.decay ="proportional", # value defining relative importance of weights, discrimate good v bad models
+                                             var.import=100) #vect, number of permutations to determine variable importance
+
+
+print("Finished: Ensemble models")
+
+
+```
+
+#Ensemble model evaluation metrics
+```{r}
+#Save evaluation metrics
+eval <- get_evaluations(EnsembleModelsOut)
+
+summary(eval)
+
+write.csv(eval, "./Generated_Data/Evaluation_datasets/Count/GUR/GURcount_ensemble_model_scores.csv", row.names = FALSE)
+
+var <- get_variables_importance(EnsembleModelsOut)
+
+summary(var)
+
+write.csv(var, "./Generated_Data/Evaluation_datasets/Count/GUR/GURcount_ensemble_variable_importance.csv", row.names = FALSE)
+
+
+print("Finished: Plotting saving ensemble model scores")
+
+ensemble_models <- EnsembleModelsOut
+
+EnsembleModelsOut <- get(load("./models_biomod/Count/GUR/GUR.GUR.ensemble.models.out"))
+
+```
+
+#Plot ensemble evaluation
+```{r}
+
+eval_scores <- eval
+eval_predictor <- var
+
+
+#Plot relative predictor importance 
+predictor_summary <- eval_predictor %>%
+  group_by(expl.var) %>%
+  summarise(
+    mean_var_imp = mean(var.imp),
+    sd_var_imp = sd(var.imp),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    var.imp.percent = mean_var_imp * 100,
+    sd.percent = sd_var_imp * 100,
+    min = var.imp.percent - sd.percent,
+    max = var.imp.percent + sd.percent
+  )
+
+plot <- ggplot() +
+  geom_col(
+    data = predictor_summary,
+    mapping = aes(
+      x = var.imp.percent,
+      y = reorder(expl.var, var.imp.percent)
+    ),
+    position = position_dodge2(padding = 0),
+    width = 0.7,
+    preserve = "total",
+    fill = "#55C667FF"
+  ) +
+  geom_errorbar(
+    data = predictor_summary,
+    mapping = aes(
+      y = expl.var,
+      xmin = min,
+      xmax = max
+    ),
+    position = position_dodge2(preserve = "total"),
+    width = 0.5,
+    size = 0.7
+  ) +
+  theme_cowplot() +
+  guides(x.sec = "axis", y.sec = "axis") +
+  theme(
+    axis.line.y.left = element_line(size = 0.75, color = "black"),
+    axis.line.y.right = element_line(size = 0.75, color = "black"),
+    axis.line.x.top = element_line(size = 0.75, color = "black"),
+    axis.line.x.bottom = element_line(size = 0.75, color = "black"),
+    axis.ticks.x.top = element_blank(),
+    axis.ticks.y.right = element_blank(),
+    axis.text.x.top = element_blank(),
+    axis.text.y.right = element_blank(),
+    axis.title = element_text(size = 16),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 9)
+  ) +
+  xlab("Predictor Importance (%)") +
+  ylab("Predictor Variable")
+
+plot
+
+
+output_path <- file.path("./Plots/PI_Plots/GUR_ensemble_predictor_importance.png")
+#ggsave(output_path, plot = plot, width = 8, height = 6, dpi = 300)
+
+#ES strip 
+#response curves 
+# Get response data
+plot_output <- bm_PlotResponseCurves(
+  bm.out = EnsembleModelsOut,
+  models.chosen = "all",
+  fixed.var = 'mean',
+  do.bivariate = FALSE,
+  do.plot = FALSE,
+  do.progress = FALSE
+)
+
+ggdat <- plot_output$tab %>%
+  dplyr::mutate(expl.var.factor = as.factor(expl.name))
+
+write.csv(ggdat, "./Generated_Data/ES_datasets/GUR_ES_Count.csv", row.names = FALSE)
+
+print("Finished: Plotting ensemble models")
+```
+
+#Projections 
+```{r}
+#eval <- get_evaluations(myBiomodModelOut)
+#good_models <- eval$full.name[eval$metric.eval == "Rsquared" & eval$evaluation >= 0.2]
+#good_models <- good_models[!is.na(good_models)]
+#good_models
+
+gc()
+
+#only select models that end up exceeding the 0.3 R-squared threshold 
+models <- get_built_models(myBiomodModelOut, algo= c("GBM", "XGBOOST", "RF", "GLM"))
+#models <- good_models
+#this works below, from Jenn's code 
+sp_proj <- BIOMOD_Projection(
+         bm.mod =  myBiomodModelOut,
+         new.env = proj.var ,
+         proj.name = 'GUR_current_count',
+         models.chosen =models,
+         digits = 2, #number of digits for predicted values
+         build.clamping.mask = TRUE, 
+         output_format = ".tif",
+         do.stack = TRUE,
+         nb.cpu = 10
+       )
+
+#png(filename = "./Plots/Maps/Abundance_Maps/GUR_count_projection.png", width = 1200, height = 1000)
+#plot(sp_proj)
+#dev.off()
+
+#gc()
+
+#run projections on ensemble models, using current climatology
+ens_proj <- BIOMOD_EnsembleForecasting(
+         bm.em = EnsembleModelsOut,
+         #new.env = proj.var,
+         bm.proj = sp_proj,
+         proj.name = 'GUR_current_count_ensembles',
+         models.chosen = 'all',
+         build.clamping.mask = TRUE, 
+         output.format=".tif",
+         do.stack=TRUE,
+         #on_0_to_1000 = FALSE 
+         )
+
+
+#png(filename = "./Plots/Maps/Abundance_Maps/GUR_count_projection_ensemble.png", width = 1200, height = 1000)
+#plot(ens_proj)
+#dev.off()
+
+
+```
+
+#Quantifying uncertainty among different algorithm projections 
+```{r}
+myBiomodModelOut <- get(load('./models_biomod/count/GUR/GUR.GUR.models.out'))
+
+models.kept <- BIOMOD_LoadModels(myBiomodModelOut)
+
+# Manually exclude models associated with RUN1, RUN4, RUN6, and allRun ( are not above threshold? )
+models.chosen <- models.kept[!grepl("RUN1|RUN4|RUN6|allRun", models.kept)]
+
+EnsembleModelsOut <- BIOMOD_EnsembleModeling(
+  bm.mod = myBiomodModelOut,
+  models.chosen = models.chosen,
+  em.by = 'PA+run',
+  em.algo = c('EMwmean'),
+  metric.select = c('Rsquared'),
+  metric.select.thresh = c(0.2),
+  metric.eval = c('Rsquared'),
+  metric.select.dataset = c('evaluation'),
+  EMci.alpha = 0.05,
+  EMwmean.decay = "proportional",
+  var.import = 100
+)
+
+
+#models <- get_built_models(myBiomodModelOut, algo= c("GBM", "XGBOOST",  "GLM", "RF"))
+#this works below, from Jenn's code 
+ens_proj <- BIOMOD_EnsembleForecasting(
+         bm.em = EnsembleModelsOut,
+         new.env = proj.var,
+         #bm.proj = sp_proj,
+         proj.name = 'GUR_current_count_ensembles_algos',
+         models.chosen = 'all',
+         build.clamping.mask = TRUE, 
+         output.format=".tif",
+         do.stack=TRUE,
+         #on_0_to_1000 = FALSE 
+         )
+
+Prediction <- terra::rast("./models_biomod/count/GUR/proj_RUR_current_count_ensembles_algos/proj_RUR_current_count_ensembles_algos_GUR_ensemble.tif")
+
+Model_Uncertainty <- terra::stdev(Prediction)
+
+terra::writeRaster(Model_Uncertainty, "./processed_data/Uncertainty/GUR_Method_Uncertainty_Count.tif", overwrite = TRUE)
+
+RC_Map <- function(RC_Layer, Legend_Label, layername, BC) {
+  # Compute min and max values for the chosen layer
+  vmin <- round(min(RC_Layer[[layername]], na.rm = TRUE), 2)
+  vmax <- round(max(RC_Layer[[layername]], na.rm = TRUE), 2)
+
+  # Calculate break points for the legend
+  breaks <- round(seq(vmin, vmax, length.out = 5), 2)
+  labels <- as.character(breaks)
+
+  # Build the ggplot
+  RC_Plot <- ggplot(BC) +
+    geom_sf(data = BC, fill = "#d9d9d9", color = NA) +
+    geom_raster(data = RC_Layer, aes(x = x, y = y, fill = .data[[layername]])) +
+    coord_sf(crs = st_crs(3005)) +
+    xlim(c(515000, 1255000)) +
+    ylim(c(340000, 1100000)) +
+    annotation_scale(location = "bl", width_hint = 0.5) +
+    annotation_north_arrow(location = "bl", which_north = "true",
+                           pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+                           style = north_arrow_fancy_orienteering) +
+    theme_cowplot() +
+    scale_fill_continuous(
+      type = "viridis",
+      na.value = NA,
+      name = Legend_Label,
+      limits = c(vmin - 0.01, vmax + 0.01),
+      breaks = breaks,
+      labels = labels
+    ) +
+    xlab(element_blank()) + ylab(element_blank()) +
+    theme(
+      legend.position = c(1, 1),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 10),
+      legend.text.align = 0,
+      legend.title.align = 0,
+      legend.justification = c("right", "top"),
+      legend.box.just = "right",
+      panel.background = element_rect(fill = "white")
+    )
+
+  return(RC_Plot)
+}
+
+# Convert SpatRaster to data frame
+RC_Layer_df <- as.data.frame(Model_Uncertainty, xy = TRUE)
+
+# Convert SpatVector to sf
+Land <- terra::vect("./raw_data/BC_Buffer/Land.shp")
+Land <- sf::st_as_sf(Land)
+
+# Create the plot
+GUR_Method_Uncertainty_Plot <- RC_Map(RC_Layer_df, "Model\nUncertainty", "std", Land)
+GUR_Method_Uncertainty_Plot 
+
+#ggsave2(filename = "./Plots/Maps/Uncertainty_Plots/GUR_Model_Uncertainty_Map_Count.jpeg", plot = GUR_Method_Uncertainty_Plot, scale = 1, height = 140, width = 115, units = "mm")
+
+```
+
+#Evaluating NULL models 
+```{r}
+gc()
+
+#Create a dataframe of the environment to pull null model training dataset from 
+Training_Data <- GUR_training_df  #needs to be a dataframe with xy, resp, env with only TRAINING data 
+Testing_Data <- GUR_evaluation_df #needs to be a dataframe with xy, resp, env with only TESTING data 
+Survey_Enviro_df <- env_df #includes all environmental data 
+Predictor_num <- ncol(env_df)
+
+#Create null models using the same parameters and randomly drawn presence points for the enviro_buffer dataframe (same background points)
+
+#Set up a dataframe to hold all of the evaluation metrics for the null models
+Null_metrics <- data.frame(
+  full.name = character(),
+  merged.by.PA = character(),
+  merged.by.run = character(),
+  merged.by.algo = character(),
+  algo = character(),
+  metric.eval = character(),
+  cutoff = logical(),
+  sensitivity= logical(),
+  calibration = numeric(),
+  validation = numeric(),
+  evaluation = numeric()
+)
+
+
+#Run 1000 null models
+for (j in 1:10){
+  
+  #Perform a random pull from the environmental dataframe for each presence point in the training dataset
+  for (i in 1:nrow(Training_Data)) {
+    set.seed(313*j + round(46*i))
+    randnum <- sample(seq_len(nrow(Survey_Enviro_df)), size = 1)
+    Training_Data[i, 4:(3+ Predictor_num)] <- Survey_Enviro_df[randnum,]
+    
+    train_resp_df <- Training_Data$mean
+    train_xy <- Training_Data %>% dplyr::select(x, y)
+    train_env <- Training_Data %>% dplyr::select(TAlk_10m_mean, salt_10m_min, temp_s_max, temp_s_min, temp_10m_mean, temp_10m_min, do_10m_mean, do_10m_min, Current, REI, Rock, Slope, Depth)
+    
+  }
+  
+  sp <- c('GUR')
+  
+  #define models to run 
+  all_models <- c("GLM","GBM", "RF", "XGBOOST" ) 
+  
+  #fit my *real* biomod2 models to null TRAINING data, made by for loop above
+  myBiomodData <- BIOMOD_FormatingData(resp.var = train_resp_df, #as SpatVector without associated data, for a single species
+                                       expl.var = train_env, #SpatRaster containing explanatory variables in layers
+                                       resp.name = sp, #character corresponding to species name
+                                       resp.xy = train_xy, #if resp.var is vector, 2 column matrix associated xy coordinates
+                                       dir.name = c('./models_biomod/null_count'), 
+                                       data.type = c("abundance"), #can also be 'ordinal'
+                                       eval.expl.var = eval_env, #SpatRaster without associated data, independent data to evaluate
+                                       eval.resp.var = eval_resp_df, #SpatVector without associated data, independent data to evaluate 
+                                       eval.resp.xy = eval_xy, #if resp.vect is vector, 2 column matrix of xy coordinates
+                                       na.rm = TRUE, 
+                                       filter.raster = TRUE, #filter points in same cell
+                                       seed.val = 1234)
+   
+  
+  cv <- bm_CrossValidation(bm.format = myBiomodData,
+                           strategy = "kfold", #options are random, k-fold, strat, block, env, or user-defined
+                           nb.rep = 1, #integer, number of repetitions of CV points to be drawn 
+                           k = 10, #number of partitions                                         
+                           do.full.models = TRUE #calibrated and validated over the whole dataset (and pseudo-absence datasets) or not
+  ) 
+  
+  
+
+  myBiomodModelOut <- BIOMOD_Modeling(bm.format = myBiomodData,
+                                      models = all_models,
+                                      CV.strategy = "user.defined",
+                                      CV.user.table = cv,
+                                      OPT.strategy = "user-defined",
+                                      OPT.user = opt.t,
+                                      metric.eval = c("MAE", "Rsquared"),
+                                      var.import = 100,
+                                      seed.val = 42,
+                                      nb.cpu = 10)
+  
+  EnsembleModelsOut <- BIOMOD_EnsembleModeling(bm.mod= myBiomodModelOut,
+                                               models.chosen = 'all', #define models kept, can exclude models here
+                                               em.by='all', #chr, way kept models are combined to build ensemble models, see below 
+                                               em.algo = c('EMwmean'), #weighted mean by the evaluation metric 
+                                               metric.select = c('Rsquared'), #metric select and threshold determines which single models to keep 
+                                               #metric.select.thresh = c(0.3),
+                                               metric.eval= c('Rsquared'),
+                                               metric.select.dataset = c('evaluation'),
+                                               EMci.alpha = 0.05, #num, significance level to estimate confidence interval
+                                               EMwmean.decay ="proportional", # value defining relative importance of weights, discrimate good v bad models
+                                               var.import=100) #vect, number of permutations to determine variable importance
+  
+  #get model evaluation metrics 
+  eval_ensemble <- get_evaluations(EnsembleModelsOut)
+  eval_ensemble <- as.data.frame(eval_ensemble)
+  
+  #add eval_ensemble to empty df of null metrics above
+  Null_metrics <- rbind(Null_metrics, eval_ensemble)
+  
+}
+
+
+#save csv of Null Metrics 
+write.csv(Null_metrics, "./Generated_Data/Evaluation_datasets/Count/GUR/GURcount_null_model_eval.csv", row.names = FALSE)
+
+```
+
+
+#Graphing real and null model comparisons 
+```{r}
+#read in files 
+models <- read.csv("./Generated_Data/Evaluation_datasets/Count/GUR/GURcount_ensemble_model_scores.csv")
+
+null <- read.csv("./Generated_Data/Evaluation_datasets/Count/GUR/GURcount_null_model_eval.csv")
+
+#Format 
+#Make a difference between testing and evaluation R²
+models$difference <- abs(models$evaluation - models$calibration)
+null$difference <- abs(null$evaluation - null$calibration)
+
+#rename columns
+models <- models %>%
+  rename("R² Training" = calibration,
+         "R² Testing" = evaluation, 
+         "R² Difference" = difference)
+
+
+null <- null %>%
+  rename("R² Training" = calibration,
+         "R² Testing" = evaluation, 
+         "R² Difference" = difference)
+
+
+
+#PLot
+#Create long-form dataframes for the model and null model metrics for plotting
+  Model_metrics_long <- models %>% pivot_longer(cols = c("R² Training", "R² Testing", "R² Difference"), names_to = "Metric", 
+                        values_to = "Value") %>% dplyr::select('Metric', 'Value')
+  
+Model_metrics_long$Metric <- factor(Model_metrics_long$Metric, levels = c("R² Training", "R² Testing", "R² Difference"))
+  
+Null_metrics_long <- null %>%
+  pivot_longer(cols = c("R² Training", "R² Testing", "R² Difference"),
+               names_to = "Metric", values_to = "Value") %>% select(Metric, Value)
+
+
+Null_metrics_long$Metric <- factor(Null_metrics_long$Metric, levels = c("R² Training", "R² Testing", "R² Difference"))
+  
+  #Plot the model and null model evaluation metrics
+  GUR_Eval_Plot <- ggplot() + geom_boxplot(data = Null_metrics_long, aes(x = Metric, y = Value, fill = Metric)) + 
+    scale_fill_manual(values = c("#613f74", "#91B3B6", "#F4E76E", "#EDAF97"), labels = c("R² Training", "R² Testing", "R² Difference")) + 
+    stat_summary(data = Model_metrics_long, aes(x = Metric, y = Value), fun.y = mean, geom = "point", colour = "#e6360F", size = 3) + 
+    xlab("Evaluation Metric") + ylab("Value") + theme_classic() + 
+    guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.x.bottom = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank()) + 
+    theme(legend.position = "none", legend.justification = "center") + 
+    theme(axis.text = element_text(size=8), axis.title = element_text(size = 12))
+  
+  
+  GUR_Eval_Plot
+  
+
+#  ggsave2(filename = "./Plots/Eval_Plots/Count/GUR_Eval_Plot.jpeg", plot = GUR_Eval_Plot, scale = 1, height = 75, width = 100, units = "mm")
+
+```
+
+#Plotting response curves
+```{r}
+
+
+#count response curve data 
+count_GUR <- read.csv("./Generated_Data/ES_datasets/GUR_ES_Count.csv")
+
+
+sp <- c("GUR")
+ggdat <- count_GUR
+ggdat$id <- as.factor(ggdat$id)
+
+#Rename 
+ggdat <- ggdat %>%
+  mutate(
+    expl.var.factor = recode(expl.var.factor,
+                             "Current" = "Current (m/s)",
+                             "Slope" = "Slope (deg)",
+                             "Rock" = "Percent Rock",
+                             "TAlk_10m_mean" = "Talkbmax (mEq/m³)",
+                             "salt_10m_min" = "Sbmin (PSU)",
+                             "temp_s_max" = "Tsmax (°C)",
+                             "temp_s_min" = "Tsmin (°C)",
+                             "temp_10m_mean" = "Tbmean (°C)",
+                             "temp_10m_min" = "Tbmin (°C)",
+                             "do_10m_mean" = "Oxybmean (ppm)",
+                             "do_10m_min" = "Oxybmin (ppm)",
+                             "Depth" = "Depth (m)"
+    )
+  )
+
+
+ggdat <- ggdat %>%
+  mutate(
+    expl.name = recode(expl.name,
+                       "Current" = "Current (m/s)",
+                       "Slope" = "Slope (deg)",
+                       "Rock" = "Percent Rock",
+                       "TAlk_10m_mean" = "Talkbmax (mEq/m³)",
+                       "salt_10m_min" = "Sbmin (PSU)",
+                       "temp_s_max" = "Tsmax (°C)",
+                       "temp_s_min" = "Tsmin (°C)",
+                       "temp_10m_mean" = "Tbmean (°C)",
+                       "temp_10m_min" = "Tbmin (°C)",
+                       "do_10m_mean" = "Oxybmean (ppm)",
+                       "do_10m_min" = "Oxybmin (ppm)",
+                       "Depth" = "Depth (m)"
+    )
+  )
+
+
+
+#Separate the two groups of predictors
+subset_0_10 <- ggdat %>%
+  filter(!expl.var.factor %in% c("Oxybmean (ppm)", "Oxybmin (ppm)"))
+
+subset_0_100 <- ggdat %>%
+  filter(expl.var.factor %in% c("Oxybmean (ppm)", "Oxybmin (ppm)"))
+
+
+#Plot for most variables (y = 0–10)
+p1 <- ggplot(subset_0_10, aes(x = expl.val, y = pred.val)) +
+  geom_smooth(aes(group = expl.var.factor), fill = "grey30", color = "#55C667FF", se = TRUE, method = "loess") +
+  facet_wrap(~ expl.var.factor, scales = "free_x", strip.position = "bottom") +  # strip labels below
+  coord_cartesian(ylim = c(-4, 4)) +
+  xlab("") +
+  ylab("Prob. of Density") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),   # remove box background
+    strip.placement = "outside"            # place strip outside plot panel
+  )
+
+# Plot for do_10m predictors (y = -200 to 200)
+p2 <- ggplot(subset_0_100, aes(x = expl.val, y = pred.val)) +
+  geom_smooth(aes(group = expl.var.factor), fill = "grey30", color = "#55C667FF", se = TRUE, method = "loess") +
+  facet_wrap(~ expl.var.factor, scales = "free_x", strip.position = "bottom") +  # strip labels below
+  coord_cartesian(ylim = c(-200, 200)) +
+  xlab("Predictor Variable") +
+  ylab("Prob. of Density") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),  # remove box background
+    strip.placement = "outside"           # place strip outside plot panel
+  )
+  
+
+# Combine the two
+p3 <- p1 / p2  # patchwork stacks them vertically
+
+p3
+#Save 
+ggsave("./Plots/ES_Plots/GUR_ES_Count.png", plot = p3, width = 6, height = 10, dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

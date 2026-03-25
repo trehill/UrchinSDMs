@@ -1,0 +1,4353 @@
+---
+title: "7_Comparing_Distributions"
+author: "Tessa Rehill"
+date: "2025-05-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load libraries 
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(cowplot)
+library(terra)
+library(sf)
+library(ggspatial)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(forcats)
+library(patchwork)
+library(grid)
+```
+
+#Load land file 
+```{r}
+#geographic layers
+Land <- terra::vect("./raw_data/BC_Buffer/Land.shp") 
+ # Convert land to sf
+  land_sf <- st_as_sf(Land)
+  
+  Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+```
+
+#Rotated map function 
+```{r}
+rotate_sf <- function(sf_obj, angle_deg, center = NULL) {
+  angle_rad <- angle_deg * pi / 180
+  
+  #get centroid if center not provided
+  if (is.null(center)) {
+    center <- st_centroid(st_union(sf_obj))
+    center_coords <- st_coordinates(center)
+  } else {
+    center_coords <- center
+  }
+  
+  #apply rotation on each geometry separately
+  rotated_geoms <- lapply(st_geometry(sf_obj), function(geom) {
+    # Extract coordinates depending on geometry type
+    coords_list <- list()
+    
+    #handle POLYGON or MULTIPOLYGON
+    if (inherits(geom, "POLYGON")) {
+      coords_list <- list(geom)
+    } else if (inherits(geom, "MULTIPOLYGON")) {
+      coords_list <- geom
+    } else {
+      stop("Unsupported geometry type")
+    }
+    
+    #rotate each polygon (rings)
+    rotated_polygons <- lapply(coords_list, function(polygon) {
+      rotated_rings <- lapply(polygon, function(ring) {
+        # matrix of coordinates
+        coords <- ring
+        
+        # translate to origin (center)
+        coords_centered <- coords - matrix(center_coords, nrow = nrow(coords), ncol = 2, byrow = TRUE)
+        
+        # rotation matrix
+        rotation_matrix <- matrix(c(cos(angle_rad), -sin(angle_rad),
+                                    sin(angle_rad), cos(angle_rad)),
+                                  nrow = 2, byrow = TRUE)
+        
+        # rotate coords
+        rotated <- t(rotation_matrix %*% t(coords_centered))
+        
+        # translate back
+        rotated <- rotated + matrix(center_coords, nrow = nrow(rotated), ncol = 2, byrow = TRUE)
+        
+        # ensure polygon ring is closed: first point == last point
+        if (!all(rotated[1,] == rotated[nrow(rotated), ])) {
+          rotated <- rbind(rotated, rotated[1, ])
+        }
+        
+        return(rotated)
+      })
+      return(rotated_rings)
+    })
+    
+    #build new geometry with rotated polygons
+    if (inherits(geom, "POLYGON")) {
+      st_polygon(rotated_polygons[[1]])
+    } else if (inherits(geom, "MULTIPOLYGON")) {
+      st_multipolygon(rotated_polygons)
+    }
+  })
+  
+  #return sf with new rotated geometries
+  new_sf <- sf_obj
+  st_geometry(new_sf) <- st_sfc(rotated_geoms, crs = st_crs(sf_obj))
+  return(new_sf)
+}
+
+rotate_points <- function(points, angle_deg, center) {
+  angle_rad <- angle_deg * pi / 180
+  coords_centered <- as.matrix(points) - matrix(center, nrow = nrow(points), ncol = 2, byrow = TRUE)
+  rotation_matrix <- matrix(c(cos(angle_rad), -sin(angle_rad),
+                              sin(angle_rad), cos(angle_rad)),
+                            nrow = 2, byrow = TRUE)
+  rotated <- t(rotation_matrix %*% t(coords_centered))
+  rotated + matrix(center, nrow = nrow(points), ncol = 2, byrow = TRUE)
+}
+
+
+```
+
+#Rotate land file 
+```{r}
+rotation_angle <- -30
+
+#Rotate land
+land_rotated <- rotate_sf(land_sf, rotation_angle)
+
+#Define bounding box corners 
+coords <- data.frame(
+  x = c(1100000, 950000, 750000, 1300000),
+  y = c(950000, 1320000, 230000, 450000)
+)
+#Rotate bounding box corners around the same centroid
+#Use the centroid of land_sf for center of rotation
+center <- st_coordinates(st_centroid(st_union(land_sf)))
+
+rotated_bbox_coords <- rotate_points(coords, rotation_angle, center)
+
+xlim <- range(rotated_bbox_coords[,1])
+ylim <- range(rotated_bbox_coords[,2])
+
+
+x_center <- mean(rotated_bbox_coords[,1])
+y_range <- range(rotated_bbox_coords[,2])  # keep this unchanged
+
+#Define a new, narrower x-range (e.g., 300 km wide instead of full range)
+#Adjust the width to your liking
+x_half_width <- 300000  # in meters
+
+xlim <- c(x_center - x_half_width, x_center + x_half_width)
+ylim <- y_range  # unchanged
+
+#Shift center slightly left (e.g., by 75,000 m)
+x_center_adjusted <- x_center - 75000  # Try 50000, 75000, or 100000 as needed
+
+#keep the same x half-width
+xlim <- c(x_center_adjusted - x_half_width, x_center_adjusted + x_half_width)
+
+#plot the rotated land shapefile with rotated bounding box limits
+ggplot() +
+  geom_sf(data = land_rotated, fill = "grey70", color = "black") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  labs(title = "Land shapefile rotated")
+
+
+#Rotated NORTH arrows
+#determining angle of north arrow
+arrow_x <- xlim[1] + 0.05 * diff(xlim)  # 5% in from the left
+arrow_y <- ylim[1] + 0.05 * diff(ylim)  # 5% up from the bottom
+
+arrow_length <- 50000  # arrow length in map units (e.g., meters)
+
+#Rotate arrow
+angle_deg <- 180 - (90 + (-rotation_angle))  
+angle_rad <- angle_deg * pi / 180
+
+#Endpoint of arrow
+end_x <- arrow_x + arrow_length * cos(angle_rad)
+end_y <- arrow_y + arrow_length * sin(angle_rad)
+
+```
+
+#Presence maps ####
+##Load prediction layers, land files and threshold datasets 
+```{r}
+#LOC predictions 
+GUR_BP <-terra::rast("./processed_data/LO_Predictions/GUR_LO_Predictions.tif")
+PUR_BP <-terra::rast("./processed_data/LO_Predictions/PUR_LO_Predictions.tif")
+RUR_BP <-terra::rast("./processed_data/LO_Predictions/RUR_LO_Predictions.tif")
+
+#threshold datasets 
+GUR_Thresholds <- read.csv("./Generated_Data/Threshold_datasets/GUR_Thresholds.csv")
+RUR_Thresholds <- read.csv("./Generated_Data/Threshold_datasets/RUR_Thresholds.csv")
+PUR_Thresholds <- read.csv("./Generated_Data/Threshold_datasets/PUR_Thresholds.csv")
+
+
+```
+
+##Green urchin 
+```{r}
+optimal_TSS_row <- GUR_Thresholds[which.max(GUR_Thresholds$TSS), ]
+optimal_TSS_threshold <- optimal_TSS_row$Threshold
+
+#Aggregate the raster based on sum
+GUR_Agg <- terra::aggregate(GUR_BP, fact=5, fun="mean")
+
+#Convert the raster to points
+GUR_Points <- terra::as.points(GUR_Agg)
+
+#Convert to a dataframe with coordinates and drop absences
+GUR_df <- st_as_sf(GUR_Points) %>% dplyr::mutate(x = sf::st_coordinates(.)[,1], y = sf::st_coordinates(.)[,2]) %>% st_drop_geometry() %>%
+  filter(meanw > optimal_TSS_threshold)
+
+GUR_Point_Map <- ggplot() +    
+  geom_sf(data = land_sf, fill = "grey80", color = NA) + 
+  geom_point(data = GUR_df, aes(x = x, y = y, size = meanw, alpha = meanw), color = "#55C667FF") + 
+  scale_size_continuous(range = c(.1,1.5), name = "LO") + 
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") + 
+  annotation_scale(location = "bl", width_hint = 0.5) + 
+  annotation_north_arrow(location = "bl", which_north = "true",
+                         pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+                         style = north_arrow_fancy_orienteering) +    
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +    
+  theme_cowplot() +    
+  xlab(NULL) +    
+  ylab(NULL) +    
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  )
+
+GUR_Point_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_Point_Map.png",   # or another path/filename
+  plot = GUR_Point_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+##Green Urchin - rotated 
+```{r}
+#Rotate green urchin points using the same rotation parameters
+GUR_df_rotated_coords <- rotate_points(
+  points = GUR_df[, c("x", "y")], 
+  angle_deg = rotation_angle, 
+  center = center
+)
+
+#Add rotated coordinates back to the dataframe
+GUR_df <- GUR_df %>%
+  dplyr::mutate(
+    x_rot = GUR_df_rotated_coords[,1],
+    y_rot = GUR_df_rotated_coords[,2]
+  )
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_BP)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_BP, coords_points)
+values_points <- extracted$meanw  # raster values at points
+
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+#Plot
+q <- ggplot() +
+  geom_point(data = GUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  # small red squares
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+  geom_point(data = GUR_df, aes(x = x_rot, y = y_rot, size = meanw, alpha = meanw), color = "#55C667FF") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "LO") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave("./Plots/Maps/Cluster_maps/GUR_Point_Map_Rotated.png", plot = q, width = 10, height = 8, dpi = 300)
+
+GUR_Point_Map <- q
+```
+```{r}
+#Plot
+q <- ggplot() +
+  geom_point(data = GUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  # small red squares
+  geom_sf(data = land_rotated, fill = 'white', color = 'black') +
+  geom_point(data = GUR_df, aes(x = x_rot, y = y_rot, size = meanw, alpha = meanw), color = "#55C667FF") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "LO") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave("./Plots/Maps/Cluster_maps/GUR_Point_Map_Rotated_outline.png", plot = q, width = 10, height = 8, dpi = 300)
+```
+
+##Green urchin - continuous LO 
+```{r}
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_BP)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_BP, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = GUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "LO", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave(
+  filename = "./Plots/Maps/LO_Plots/GUR_LO_Map_Rotated.png",   # or another path/filename
+  plot = g,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+GUR_Presence_Plot_Continuous  <- g
+```
+
+##Purple Urchin 
+```{r}
+optimal_TSS_row <- PUR_Thresholds[which.max(PUR_Thresholds$TSS), ]
+optimal_TSS_threshold <- optimal_TSS_row$Threshold
+
+#Aggregate the raster based on sum
+PUR_Agg <- terra::aggregate(PUR_BP, fact=5, fun="mean")
+#Convert the raster to points
+PUR_Points <- terra::as.points(PUR_Agg)
+#Convert to a dataframe with coordinates and drop absences
+PUR_df <- st_as_sf(PUR_Points) %>% dplyr::mutate(x = sf::st_coordinates(.)[,1], y = sf::st_coordinates(.)[,2]) %>% st_drop_geometry() %>%
+  filter(meanw > optimal_TSS_threshold)
+
+
+PUR_Point_Map <- ggplot() +    
+  geom_sf(data = land_sf, fill = "grey80", color = NA) + 
+  geom_point(data = PUR_df, aes(x = x, y = y, size = meanw, alpha = meanw), color = "#a503fc") + 
+  scale_size_continuous(range = c(.1,1.5), name = "LO") + 
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") + 
+  annotation_scale(location = "bl", width_hint = 0.5) + 
+  annotation_north_arrow(location = "bl", which_north = "true",
+                         pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+                         style = north_arrow_fancy_orienteering) +    
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +    
+  theme_cowplot() +    
+  xlab(NULL) +    
+  ylab(NULL) +    
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  )
+PUR_Point_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/PUR_Point_Map.png",   # or another path/filename
+  plot = PUR_Point_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+##Purple urchin -rotated 
+```{r}
+#Rotate green urchin points using the same rotation parameters
+PUR_df_rotated_coords <- rotate_points(
+  points = PUR_df[, c("x", "y")], 
+  angle_deg = rotation_angle, 
+  center = center
+)
+
+#Add rotated coordinates back to the dataframe
+PUR_df <- PUR_df %>%
+  dplyr::mutate(
+    x_rot = PUR_df_rotated_coords[,1],
+    y_rot = PUR_df_rotated_coords[,2]
+  )
+
+#Adding buffer, rotated 
+PUR_points_full <- terra::as.points(PUR_BP)
+coords_points <- terra::crds(PUR_points_full)
+
+extracted <- terra::extract(PUR_BP, coords_points)
+values_points <- extracted$meanw  # raster values at points
+
+PUR_df_full <- st_as_sf(PUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+rotated_coords <- rotate_points(
+  points = PUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+PUR_df_full <- PUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+#Plot
+q <- ggplot() +
+  geom_point(data = PUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  # small red squares
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+  geom_point(data = PUR_df, aes(x = x_rot, y = y_rot, size = meanw, alpha = meanw), color = "#a503fc") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "LO") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave("./Plots/Maps/Cluster_maps/PUR_Point_Map_Rotated.png", plot = q, width = 10, height = 8, dpi = 300)
+
+PUR_Point_Map <- q
+```
+
+```{r}
+#Plot
+q <- ggplot() +
+  geom_point(data = PUR_df_full, aes(x = x_rot, y = y_rot), color = "grey70", shape = 15, size = 0.3, alpha = 0.1) +  # small red squares
+  geom_sf(data = land_rotated, fill = 'white', color = 'black') +
+  geom_point(data = PUR_df, aes(x = x_rot, y = y_rot, size = meanw, alpha = meanw), color = "#a503fc") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "LO") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+ggsave("./Plots/Maps/Cluster_maps/PUR_Point_Map_Rotated_outline.png", plot = q, width = 10, height = 8, dpi = 300)
+
+```
+
+##Purple urchin - LO continuous
+```{r}
+#Adding buffer, rotated 
+PUR_points_full <- terra::as.points(PUR_BP)
+coords_points <- terra::crds(PUR_points_full)
+
+extracted <- terra::extract(PUR_BP, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+PUR_df_full <- st_as_sf(PUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = PUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+PUR_df_full <- PUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = PUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "LO", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave(
+  filename = "./Plots/Maps/LO_Plots/PUR_LO_Map_Rotated.png",   # or another path/filename
+  plot = g,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+PUR_Presence_Plot_Continuous  <- g
+```
+
+##Red urchin 
+```{r}
+optimal_TSS_row <- RUR_Thresholds[which.max(RUR_Thresholds$TSS), ]
+optimal_TSS_threshold <- optimal_TSS_row$Threshold
+
+#Aggregate the raster based on sum
+RUR_Agg <- terra::aggregate(RUR_BP, fact=5, fun="mean")
+#Convert the raster to points
+RUR_Points <- terra::as.points(RUR_Agg)
+#Convert to a dataframe with coordinates and drop absences
+RUR_df <- st_as_sf(RUR_Points) %>% dplyr::mutate(x = sf::st_coordinates(.)[,1], y = sf::st_coordinates(.)[,2]) %>% st_drop_geometry() %>%
+  filter(meanw > optimal_TSS_threshold)
+
+
+RUR_Point_Map <- ggplot() +    
+  geom_sf(data = land_sf, fill = "grey80", color = NA) + 
+  geom_point(data = RUR_df, aes(x = x, y = y, size = meanw, alpha = meanw), color = "#e6360F") + 
+  scale_size_continuous(range = c(.1,1.5), name = "LO") + 
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") + 
+  annotation_scale(location = "bl", width_hint = 0.5) + 
+  annotation_north_arrow(location = "bl", which_north = "true",
+                         pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+                         style = north_arrow_fancy_orienteering) +    
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +    
+  theme_cowplot() +    
+  xlab(NULL) +    
+  ylab(NULL) +    
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  )
+RUR_Point_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_Point_Map.png",   # or another path/filename
+  plot = RUR_Point_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+```
+##Red urchin - rotated 
+```{r}
+#Rotate green urchin points using the same rotation parameters
+RUR_df_rotated_coords <- rotate_points(
+  points = RUR_df[, c("x", "y")], 
+  angle_deg = rotation_angle, 
+  center = center
+)
+
+#Add rotated coordinates back to the dataframe
+RUR_df <- RUR_df %>%
+  dplyr::mutate(
+    x_rot = RUR_df_rotated_coords[,1],
+    y_rot = RUR_df_rotated_coords[,2]
+  )
+
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_BP)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_BP, coords_points)
+values_points <- extracted$meanw  # raster values at points
+
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+#Plot
+q <- ggplot() +
+  geom_point(data = RUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  # small red squares
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+  geom_point(data = RUR_df, aes(x = x_rot, y = y_rot, size = meanw, alpha = meanw), color = "#e6360F") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "LO") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave("./Plots/Maps/Cluster_maps/RUR_Point_Map_Rotated.png", plot = q, width = 10, height = 8, dpi = 300)
+
+RUR_Point_Map <- q
+```
+
+```{r}
+#Plot
+q <- ggplot() +
+  geom_point(data = RUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  # small red squares
+  geom_sf(data = land_rotated,  fill = 'white', color = 'black') +
+  geom_point(data = RUR_df, aes(x = x_rot, y = y_rot, size = meanw, alpha = meanw), color = "#e6360F") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "LO") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "LO") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave("./Plots/Maps/Cluster_maps/RUR_Point_Map_Rotated_outline.png", plot = q, width = 10, height = 8, dpi = 300)
+
+
+
+```
+
+##Red urchin - LOC continuous
+```{r}
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_BP)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_BP, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = RUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "LO", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave(
+  filename = "./Plots/Maps/LO_Plots/RUR_LO_Map_Rotated.png",   # or another path/filename
+  plot = g,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+RUR_Presence_Plot_Continuous  <- g
+```
+
+
+#Combine presence maps 
+```{r}
+presence_combined_plot <- PUR_Point_Map + GUR_Point_Map + RUR_Point_Map + 
+  plot_layout(ncol = 3)  
+
+presence_combined_plot
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/Combined_Presence_Map.png",   # or another path/filename
+  plot = presence_combined_plot,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+
+######
+
+presence_combined_plot <- PUR_Presence_Plot_Continuous + GUR_Presence_Plot_Continuous + RUR_Presence_Plot_Continuous + 
+  plot_layout(ncol = 3)  
+
+presence_combined_plot
+
+ggsave(
+  filename = "./Plots/Maps/LO_Plots/Combined_Presence_Continuous_Map.png",   # or another path/filename
+  plot = presence_combined_plot,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+
+
+```
+
+#LOC Uncertainty Maps ####
+##Green urchin - presence uncertainty
+```{r}
+#read in uncertainty 
+GUR_Uncertainty <-terra::rast("./processed_data/Uncertainty/GUR_Method_Uncertainty.tif")
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_Uncertainty)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_Uncertainty, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = GUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Uncertainty", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave("./Plots/Maps/Uncertainty_Plots/GUR_Model_Uncertainty_Map_Rotate.png", plot = g, width = 10, height = 8, dpi = 300)
+
+GUR_Uncertainty_Plot  <- g
+```
+
+##Purple urchin - presence uncertainty
+```{r}
+#read in uncertainty 
+PUR_Uncertainty <-terra::rast("./processed_data/Uncertainty/PUR_Method_Uncertainty.tif")
+
+#Adding buffer, rotated 
+PUR_points_full <- terra::as.points(PUR_Uncertainty)
+coords_points <- terra::crds(PUR_points_full)
+
+extracted <- terra::extract(PUR_Uncertainty, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+PUR_df_full <- st_as_sf(PUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = PUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+PUR_df_full <- PUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = PUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Uncertainty", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave("./Plots/Maps/Uncertainty_Plots/PUR_Model_Uncertainty_Map_Rotate.png", plot = g, width = 10, height = 8, dpi = 300)
+
+PUR_Uncertainty_Plot <- g
+```
+
+##Red urchin - presence uncertainty 
+```{r}
+#read in uncertainty 
+RUR_Uncertainty <-terra::rast("./processed_data/Uncertainty/RUR_Method_Uncertainty.tif")
+
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_Uncertainty)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_Uncertainty, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = RUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Uncertainty", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave("./Plots/Maps/Uncertainty_Plots/RUR_Model_Uncertainty_Map_Rotate.png", plot = g, width = 10, height = 8, dpi = 300)
+
+RUR_Uncertainty_Plot <- g
+```
+
+###Plot presence uncertainties together
+```{r}
+presence_uncertainty_combined_plot <- PUR_Uncertainty_Plot + GUR_Uncertainty_Plot + RUR_Uncertainty_Plot + 
+  plot_layout(ncol = 3)  
+
+presence_uncertainty_combined_plot
+
+ggsave(
+  filename = "./Plots/Maps/Uncertainty_Plots/Combined_Presence_Uncertainty_Map.png",   # or another path/filename
+  plot = presence_uncertainty_combined_plot,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+```
+
+#Count maps ####
+##Load prediction layers (rasters) + land files
+```{r}
+
+#count predictions
+GUR_Count_Raster <- rast("./models_biomod/count_projections/GUR/proj_GUR_current_count_ensembles/proj_GUR_current_count_ensembles_GUR_ensemble.tif")
+RUR_Count_Raster <- rast("./models_biomod/count_projections/RUR/proj_RUR_current_count_ensembles/proj_RUR_current_count_ensembles_RUR_ensemble.tif")
+
+#masks (extrapolated variables)
+GURclamp <- rast("./models_biomod/count/GUR/proj_GUR_current_count/proj_GUR_current_count_ClampingMask.tif")
+
+RURclamp <- rast("./models_biomod/count/RUR/proj_RUR_current_count/proj_RUR_current_count_ClampingMask.tif")
+
+#Remove cells that extrapolate
+GUR_Count_Raster_Mask <- mask(GUR_Count_Raster, GURclamp >= 1, maskvalue = TRUE)
+RUR_Count_Raster_Mask <- mask(RUR_Count_Raster, RURclamp >= 1, maskvalue = TRUE)
+```
+
+##Abundance map (no aggregations)
+```{r}
+AC_Map <- function(AC_Raster, Legend_Label, BC_Shapefile) {
+  
+  # Convert raster to dataframe for ggplot
+  AC_df <- as.data.frame(AC_Raster, xy = TRUE, na.rm = TRUE)
+  colnames(AC_df)[3] <- "value"  # Rename third column to "value" for clarity
+
+  # Convert land shapefile to sf
+  BC_sf <- st_as_sf(BC_Shapefile)
+
+  # Define breaks and labels based on raster values
+  min_val <- round(minmax(AC_Raster)[1], 2)
+  max_val <- round(minmax(AC_Raster)[2], 2)
+  breaks_seq <- round(seq(min_val, max_val, length.out = 5), 2)
+
+  # Plot
+  AC_Plot <- ggplot() +
+    geom_sf(data = BC_sf, fill = "grey80", color = NA) +
+    geom_tile(data = AC_df, aes(x = x, y = y, fill = value)) +
+    scale_fill_viridis_c(
+      na.value = NA,
+      name = Legend_Label,
+      limits = c(min_val - 0.01, max_val + 0.01),
+      breaks = breaks_seq,
+      labels = as.character(breaks_seq)
+    ) +
+    coord_sf(
+      crs = st_crs(3005),
+      xlim = c(515000, 1255000),
+      ylim = c(340000, 1222000)
+    ) +
+    annotation_scale(location = "bl", width_hint = 0.5) +
+    annotation_north_arrow(
+      location = "bl", which_north = "true",
+      pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+      style = north_arrow_fancy_orienteering
+    ) +
+    theme_cowplot() +
+    labs(x = NULL, y = NULL) +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      legend.position = c(1, 1),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 20),
+      legend.justification = c("right", "top"),
+      legend.box.just = "right"
+    )
+  
+  return(AC_Plot)
+}
+
+#Green urchin map
+
+GUR_Map <- AC_Map(GUR_Count_Raster, "Green Urchin Abundance", Land)
+
+GUR_Map
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/GUR_Abundance_Map.png",   # or another path/filename
+  plot = GUR_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+
+#Red urchin map
+RUR_Map <- AC_Map(RUR_Count_Raster, "Red Urchin Abundance", Land)
+
+RUR_Map
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/RUR_Abundance_Map.png",   # or another path/filename
+  plot = RUR_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+```
+
+##Green urchin count (continuous) rotated 
+```{r}
+#read in raster
+GUR_Count_Raster_Mask
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_Count_Raster_Mask)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_Count_Raster_Mask, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = GUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Density (m²)", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/GUR_Abundance_Map_Rotated.png",   # or another path/filename
+  plot = g,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+GUR_Abundance_Plot_Continuous  <- g
+```
+
+##Red urchin count (continuous) rotated 
+```{r}
+#read in raster
+RUR_Count_Raster_Mask
+
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_Count_Raster_Mask)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_Count_Raster_Mask, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = RUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Density (m²)", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/RUR_Abundance_Map_Rotated.png",   # or another path/filename
+  plot = g,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+RUR_Abundance_Plot_Continuous  <- g
+```
+
+###Combine red and green continuous rotated maps 
+```{r}
+abundance_continuous_plots<- GUR_Abundance_Plot_Continuous + RUR_Abundance_Plot_Continuous + 
+  plot_layout(ncol = 2)  
+
+abundance_continuous_plots
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/Combined_Abundance_Continuous.png",   # or another path/filename
+  plot = abundance_continuous_plots,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+```
+
+
+##Green cluster abundance maps 
+```{r}
+
+#Import one of my raster prediction layers
+GUR_BP <- GUR_Count_Raster_Mask
+
+#Aggregate the raster based on sum
+GUR_Agg <- terra::aggregate(GUR_BP, fact=5, fun="mean")
+
+model_name <- c("GUR_EMwmeanByRsquared_mergedData_mergedRun_mergedAlgo")
+
+#Convert the raster to points
+GUR_Points <- terra::as.points(GUR_Agg)
+
+#Convert to a dataframe with coordinates and drop absences
+GUR_df <- st_as_sf(GUR_Points) %>% dplyr::mutate(x = sf::st_coordinates(.)[,1], y = sf::st_coordinates(.)[,2]) %>% st_drop_geometry() %>%
+  filter(GUR_EMwmeanByRsquared_mergedData_mergedRun_mergedAlgo > 0)
+
+GUR_df <- GUR_df %>%
+  rename(Likelihood = GUR_EMwmeanByRsquared_mergedData_mergedRun_mergedAlgo)
+
+
+GUR_Count_Map <- ggplot() +    
+  geom_sf(data = land_sf, fill = "grey80", color = NA) + 
+  geom_point(data = GUR_df, aes(x = x, y = y, size = Likelihood, alpha = Likelihood), color = "#55C667FF") + 
+  scale_size_continuous(range = c(.1, 1.5), name = "Mean Density (m²)") + 
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "Mean Density (m²)") + 
+  annotation_scale(location = "bl", width_hint = 0.5) + 
+  annotation_north_arrow(location = "bl", which_north = "true",
+                         pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+                         style = north_arrow_fancy_orienteering) +    
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +    
+  theme_cowplot() +    
+  xlab(NULL) +    
+  ylab(NULL) +    
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  )
+
+GUR_Count_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_Count_Map.png",   # or another path/filename
+  plot = GUR_Count_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+#Green cluster abundance map - rotated 
+```{r}
+
+names(GUR_BP) <- "value"
+
+#Rotate green urchin points using the same rotation parameters
+GUR_df_rotated_coords <- rotate_points(
+  points = GUR_df[, c("x", "y")], 
+  angle_deg = rotation_angle, 
+  center = center
+)
+
+#Add rotated coordinates back to the dataframe
+GUR_df <- GUR_df %>%
+  dplyr::mutate(
+    x_rot = GUR_df_rotated_coords[,1],
+    y_rot = GUR_df_rotated_coords[,2]
+  )
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_BP)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_BP, coords_points)
+values_points <- extracted$value 
+
+
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+#Plot
+q <- ggplot() +
+  geom_point(data = GUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+  geom_point(data = GUR_df, aes(x = x_rot, y = y_rot, size = Likelihood, alpha = Likelihood), color = "#55C667FF") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Mean Density (m²)") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "Mean Density (m²)") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_Count_Map_Rotated.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+GUR_Count_Map <- q
+```
+
+```{r}
+#Plot
+q <- ggplot() +
+  geom_point(data = GUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "white", color = 'black') +
+  geom_point(data = GUR_df, aes(x = x_rot, y = y_rot, size = Likelihood, alpha = Likelihood), color = "#55C667FF") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Mean Density (m²)") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "Mean Density (m²)") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_Count_Map_Rotated_outline.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+##Red cluster abundance map 
+```{r}
+#Import one of my raster prediction layers
+RUR_BP <- RUR_Count_Raster_Mask
+
+#Aggregate the raster based on sum
+RUR_Agg <- terra::aggregate(RUR_BP, fact=5, fun="mean")
+
+model_name <- c("RUR_EMwmeanByRsquared_mergedData_mergedRun_mergedAlgo")
+
+#Convert the raster to points
+RUR_Points <- terra::as.points(RUR_Agg)
+
+#Convert to a dataframe with coordinates and drop absences
+RUR_df <- st_as_sf(RUR_Points) %>% dplyr::mutate(x = sf::st_coordinates(.)[,1], y = sf::st_coordinates(.)[,2]) %>% st_drop_geometry() %>%
+  filter(RUR_EMwmeanByRsquared_mergedData_mergedRun_mergedAlgo > 0)
+
+RUR_df <- RUR_df %>%
+  rename(Likelihood = RUR_EMwmeanByRsquared_mergedData_mergedRun_mergedAlgo)
+
+
+RUR_Count_Map <- ggplot() +    
+  geom_sf(data = land_sf, fill = "grey80", color = NA) + 
+  geom_point(data = RUR_df, aes(x = x, y = y, size = Likelihood, alpha = Likelihood), color = "#e6360F") + 
+  scale_size_continuous(range = c(.1, 1.5), name = "Mean Density (m²)") + 
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "Mean Density (m²)") + 
+  annotation_scale(location = "bl", width_hint = 0.5) + 
+  annotation_north_arrow(location = "bl", which_north = "true",
+                         pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+                         style = north_arrow_fancy_orienteering) +    
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +    
+  theme_cowplot() +    
+  xlab(NULL) +    
+  ylab(NULL) +    
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA))  # No box around legend
+
+RUR_Count_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_Count_Map.png",   # or another path/filename
+  plot = RUR_Count_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+#Red urchin count - rotated 
+```{r}
+names(RUR_BP) <- "value"
+
+#Rotate green urchin points using the same rotation parameters
+RUR_df_rotated_coords <- rotate_points(
+  points = RUR_df[, c("x", "y")], 
+  angle_deg = rotation_angle, 
+  center = center
+)
+
+#Add rotated coordinates back to the dataframe
+RUR_df <- RUR_df %>%
+  dplyr::mutate(
+    x_rot = RUR_df_rotated_coords[,1],
+    y_rot = RUR_df_rotated_coords[,2]
+  )
+
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_BP)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_BP, coords_points)
+values_points <- extracted$value 
+
+
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+#Plot
+q <- ggplot() +
+  geom_point(data = RUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+  geom_point(data = RUR_df, aes(x = x_rot, y = y_rot, size = Likelihood, alpha = Likelihood), color = "#e6360F") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Mean Density (m²)") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "Mean Density (m²)") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_Count_Map_Rotated.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+RUR_Count_Map <- q
+```
+
+```{r}
+#Plot
+q <- ggplot() +
+  geom_point(data = RUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "white", color = 'black') +
+  geom_point(data = RUR_df, aes(x = x_rot, y = y_rot, size = Likelihood, alpha = Likelihood), color = "#e6360F") +
+  scale_size_continuous(range = c(0.1, 1.5), name = "Mean Density (m²)") +
+  scale_alpha_continuous(range = c(0.1, 0.5), name = "Mean Density (m²)") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)  # No box around legend
+  ) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_Count_Map_Rotated_outline.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+###Combine count maps 
+```{r}
+count_combined_plot <- GUR_Count_Map + RUR_Count_Map+ 
+  plot_layout(ncol = 2)  
+
+count_combined_plot
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/Combined_Count_Map.png",   # or another path/filename
+  plot = count_combined_plot,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+
+
+```
+
+#Uncertainty Count Maps ####
+#Green urchin count uncertainty
+```{r}
+#read in uncertainty 
+GUR_Uncertainty <-terra::rast("./processed_data/Uncertainty/GUR_Method_Uncertainty_Count.tif")
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_Uncertainty)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_Uncertainty, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = GUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Uncertainty (m²)", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave("./Plots/Maps/Uncertainty_Plots/GUR_Model_Uncertainty_Map_Count_Rotate.jpeg", plot = g, width = 10, height = 8, dpi = 300)
+
+GUR_Uncertainty_Plot  <- g
+```
+
+#Red urchin count uncertainty 
+```{r}
+#read in uncertainty 
+RUR_Uncertainty <-terra::rast("./processed_data/Uncertainty/RUR_Method_Uncertainty_Count.tif")
+
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_Uncertainty)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_Uncertainty, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = RUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Uncertainty (m²)", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave("./Plots/Maps/Uncertainty_Plots/RUR_Model_Uncertainty_Map_Count_Rotate.jpeg", plot = g, width = 10, height = 8, dpi = 300)
+
+RUR_Uncertainty_Plot <- g
+```
+
+###Combine uncertainty plots 
+```{r}
+count_uncertainty_combined_plot <- GUR_Uncertainty_Plot + RUR_Uncertainty_Plot + 
+  plot_layout(ncol = 2)  
+
+count_uncertainty_combined_plot
+
+ggsave(
+  filename = "./Plots/Maps/Uncertainty_Plots/Combined_Count_Uncertainty_Map.png",   # or another path/filename
+  plot = count_uncertainty_combined_plot,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+```
+
+#Relative abundance maps ####
+```{r}
+#PREDICTIONS ########
+
+RUR_Ordinal_Raster <- rast("./models_biomod/ordinal/RUR/proj_RUR_current_ord_ensembles/proj_RUR_current_ord_ensembles_RUR_ensemble.tif")
+
+GUR_Ordinal_Raster <- rast("./models_biomod/ordinal/GUR/proj_GUR_current_ord_ensembles/proj_GUR_current_ord_ensembles_GUR_ensemble.tif")
+
+
+#CLAMPS #########
+#masks (extrapolated variables)
+#GURclamp <- rast("./models_biomod/ordinal/GUR/proj_GUR_current_ord/proj_GUR_current_ord_ClampingMask.tif")
+
+#RURclamp <- rast("./models_biomod/ordinal/RUR/proj_RUR_current_ord/proj_RUR_current_ord_ClampingMask.tif")
+
+#Remove cells that extrapolate
+#GUR_Ordinal_Raster_Mask <- mask(GUR_Ordinal_Raster, GURclamp >= 1, maskvalue = TRUE)
+#RUR_Ordinal_Raster_Mask <- mask(RUR_Ordinal_Raster, RURclamp >= 1, maskvalue = TRUE)
+
+
+##
+GUR_Ordinal_Raster_Mask <- GUR_Ordinal_Raster
+RUR_Ordinal_Raster_Mask <- RUR_Ordinal_Raster
+
+
+AC_df_GUR <- as.data.frame(GUR_Ordinal_Raster_Mask, xy = TRUE, na.rm = TRUE)
+AC_df_RUR <- as.data.frame(RUR_Ordinal_Raster_Mask, xy = TRUE, na.rm = TRUE)
+
+```
+
+##Continuous 
+```{r}
+AC_Map <- function(AC_Raster, Legend_Label, BC_Shapefile) {
+  # Convert raster to dataframe for ggplot
+  AC_df <- as.data.frame(AC_Raster, xy = TRUE, na.rm = TRUE)
+  colnames(AC_df)[3] <- "value"  # Rename third column to "value"
+
+  # Convert land shapefile to sf
+  BC_sf <- st_as_sf(BC_Shapefile)
+
+  # Convert value to factor with labels
+  AC_df$value <- factor(AC_df$value,
+                        levels = c(1, 2, 3, 4),
+                        labels = c("None", "Few", "Many", "Abundant"))
+
+  # Plot
+  AC_Plot <- ggplot() +
+    geom_sf(data = BC_sf, fill = "grey80", color = NA) +
+    geom_tile(data = AC_df, aes(x = x, y = y, fill = value)) +
+    scale_fill_manual(
+      values = viridis::viridis(4),
+      name = Legend_Label,
+      drop = FALSE
+    ) +
+    coord_sf(
+      crs = st_crs(3005),
+      xlim = c(515000, 1255000),
+      ylim = c(340000, 1222000)
+    ) +
+    annotation_scale(location = "bl", width_hint = 0.5) +
+    annotation_north_arrow(
+      location = "bl", which_north = "true",
+      pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+      style = north_arrow_fancy_orienteering
+    ) +
+    theme_cowplot() +
+    labs(x = NULL, y = NULL) +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      legend.position = c(1, 1),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 20),
+      legend.justification = c("right", "top"),
+      legend.box.just = "right"
+    )
+
+  return(AC_Plot)
+}
+
+
+
+
+
+#Red urchin map
+RUR_Map <- AC_Map(RUR_Ordinal_Raster, "Red Urchin Relative Abundance", Land)
+
+RUR_Map
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/RUR_RelativeAbundance_Map.png",   # or another path/filename
+  plot = RUR_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+
+
+```
+```{r}
+AC_Map <- function(AC_Raster, Legend_Label, BC_Shapefile) {
+  # Convert raster to dataframe for ggplot
+  AC_df <- as.data.frame(AC_Raster, xy = TRUE, na.rm = TRUE)
+  colnames(AC_df)[3] <- "value"  # Rename third column to "value"
+
+  # Convert land shapefile to sf
+  BC_sf <- st_as_sf(BC_Shapefile)
+
+  # Convert value to factor with labels
+  AC_df$value <- factor(AC_df$value,
+                        levels = c(0, 1, 2, 3),
+                        labels = c("None", "Few", "Many", "Abundant"))
+
+  # Plot
+  AC_Plot <- ggplot() +
+    geom_sf(data = BC_sf, fill = "grey80", color = NA) +
+    geom_tile(data = AC_df, aes(x = x, y = y, fill = value)) +
+    scale_fill_manual(
+      values = viridis::viridis(4),
+      name = Legend_Label,
+      drop = FALSE
+    ) +
+    coord_sf(
+      crs = st_crs(3005),
+      xlim = c(515000, 1255000),
+      ylim = c(340000, 1222000)
+    ) +
+    annotation_scale(location = "bl", width_hint = 0.5) +
+    annotation_north_arrow(
+      location = "bl", which_north = "true",
+      pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+      style = north_arrow_fancy_orienteering
+    ) +
+    theme_cowplot() +
+    labs(x = NULL, y = NULL) +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      legend.position = c(1, 1),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 20),
+      legend.justification = c("right", "top"),
+      legend.box.just = "right"
+    )
+
+  return(AC_Plot)
+}
+
+#Green urchin map
+
+GUR_Map <- AC_Map(GUR_Ordinal_Raster, "Green Urchin Relative Abundance", Land)
+GUR_Map 
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/GUR_RelativeAbundance_Map.png",   # or another path/filename
+  plot = GUR_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+```
+
+
+
+#Green continuous - rotated
+```{r}
+# Read in and convert raster to points
+GUR_points_full <- terra::as.points(GUR_Ordinal_Raster_Mask)
+coords_points <- terra::crds(GUR_points_full)
+extracted <- terra::extract(GUR_Ordinal_Raster_Mask, coords_points)
+values_points <- extracted[[1]]  # First and only column
+
+# Build dataframe with coordinates and extracted values
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[, 1],
+    y = sf::st_coordinates(.)[, 2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+# Rotate coordinates
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[, 1],
+    y_rot = rotated_coords[, 2],
+    value = factor(value, levels = c(0, 1, 2, 3), labels = c("None", "Few", "Many", "Abundant"))
+  )
+
+# Create plot
+g <- ggplot() +
+  # Raster points with category-based fill
+  geom_point(
+    data = GUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+
+  # Rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # Discrete viridis scale
+  scale_color_viridis_d(
+    name = "Relative\nAbundance",
+    option = "C"
+  ) +
+
+  # Customize legend key size
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+
+  # Coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # Themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c(0.98, 0.98),
+    legend.justification = c("right", "top")
+    # legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # North arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+# Show plot
+g
+
+# Save to file
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/GUR_RelativeAbundance_Map_Rotated.png",
+  plot = g,
+  width = 6,
+  height = 8,
+  dpi = 300
+)
+
+# Store for reuse
+GUR_RA_Plot_Continuous <- g
+
+```
+
+##Red continuous - rotated
+```{r}
+# Read in and convert raster to points
+RUR_points_full <- terra::as.points(RUR_Ordinal_Raster_Mask)
+coords_points <- terra::crds(RUR_points_full)
+extracted <- terra::extract(RUR_Ordinal_Raster_Mask, coords_points)
+values_points <- extracted[[1]]  # First and only column
+
+# Build dataframe with coordinates and extracted values
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[, 1],
+    y = sf::st_coordinates(.)[, 2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+# Rotate coordinates
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[, 1],
+    y_rot = rotated_coords[, 2],
+    value = droplevels(factor(value, levels = c(1, 2, 3, 4), labels = c("None", "Few", "Many", "Abundant")))
+  )
+
+
+# Create plot
+g <- ggplot() +
+  # Raster points with category-based fill
+  geom_point(
+    data = RUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+
+  # Rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # Discrete viridis scale
+  scale_color_viridis_d(
+    name = "Relative\nAbundance",
+    option = "C"
+  ) +
+
+  # Customize legend key size
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+
+  # Coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # Themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c(0.98, 0.98),
+    legend.justification = c("right", "top")
+    # legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # North arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+# Show plot
+g
+
+# Save to file
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/RUR_RelativeAbundance_Map_Rotated.png",
+  plot = g,
+  width = 6,
+  height = 8,
+  dpi = 300
+)
+
+# Store for reuse
+RUR_RA_Plot_Continuous <- g
+
+```
+
+###Combine continuous RA
+```{r}
+abundance_continuous_plots<- GUR_RA_Plot_Continuous + RUR_RA_Plot_Continuous + 
+  plot_layout(ncol = 2)  
+
+abundance_continuous_plots
+
+ggsave(
+  filename = "./Plots/Maps/Abundance_Maps/Combined_RA_Continuous.png",   # or another path/filename
+  plot = abundance_continuous_plots,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+```
+
+
+#Cluster maps 
+```{r}
+#Import one of my raster prediction layers
+GUR_BP <- GUR_Ordinal_Raster_Mask
+
+#Aggregate the raster based on sum
+GUR_Agg <- terra::aggregate(GUR_BP, fact=1, fun="mean")
+
+model_name <- c("GUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo")
+
+#Convert the raster to points
+GUR_Points <- terra::as.points(GUR_Agg)
+
+#Convert to a dataframe with coordinates and drop absences
+GUR_df <- st_as_sf(GUR_Points) %>%
+  dplyr::mutate(x = sf::st_coordinates(.)[,1],
+                y = sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry() 
+
+GUR_df <- filter(GUR_df, GUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo %in% c(1, 2, 3)) 
+GUR_df <- rename(GUR_df, Likelihood = GUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo) 
+GUR_df <- mutate(GUR_df, Likelihood = factor(Likelihood,
+                             levels = c(1, 2, 3),
+                             labels = c("Few", "Many", "Abundant")))
+
+
+GUR_RA_Map <- ggplot() +
+  geom_sf(data = land_sf, fill = "grey80", color = NA) +
+  geom_point(data = GUR_df, aes(x = x, y = y, color = Likelihood), size = 0.3, alpha = 0.2) +
+  scale_color_manual(
+    name = "Relative Abundance",
+    values = c("Few" = "#cfeec9", "Many" = "#55C667FF", "Abundant" = "#1b5817" )
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(
+    location = "bl", which_north = "true",
+    pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+    style = north_arrow_fancy_orienteering
+  ) +
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)) + 
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))  
+
+GUR_RA_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_Relative_Map.png",   # or another path/filename
+  plot = GUR_RA_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+
+
+```
+#Green urchin - rotated 
+```{r}
+names(GUR_BP) <- "value"
+
+#Rotate green urchin points using the same rotation parameters
+GUR_df_rotated_coords <- rotate_points(
+  points = GUR_df[, c("x", "y")], 
+  angle_deg = rotation_angle, 
+  center = center
+)
+
+#Add rotated coordinates back to the dataframe
+GUR_df <- GUR_df %>%
+  dplyr::mutate(
+    x_rot = GUR_df_rotated_coords[,1],
+    y_rot = GUR_df_rotated_coords[,2]
+  )
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_BP)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_BP, coords_points)
+values_points <- extracted$value 
+
+
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+#Plot
+q <- ggplot() +
+  geom_point(data = GUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+  geom_point(data = GUR_df, aes(x = x_rot, y = y_rot, color = Likelihood), size = 0.3, alpha = 0.2) +
+  scale_color_manual(
+    name = "Relative Abundance",
+    values = c("Few" = "#cfeec9", "Many" = "#55C667FF","Abundant" = "#1b5817" )
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)) + 
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_Relative_Map_Rotated.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+GUR_RA_Map <- q
+```
+
+```{r}
+#Plot
+q <- ggplot() +
+  geom_point(data = GUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "white", color = 'black') +
+  geom_point(data = GUR_df, aes(x = x_rot, y = y_rot, color = Likelihood), size = 0.3, alpha = 0.2) +
+  scale_color_manual(
+    name = "Relative Abundance",
+    values = c("Few" = "#cfeec9", "Many" = "#55C667FF","Abundant" = "#1b5817" )
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)) + 
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_Relative_Map_Rotated_outline.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+#Red urchin
+```{r}
+#Import one of my raster prediction layers
+RUR_BP <- RUR_Ordinal_Raster_Mask
+
+#Aggregate the raster based on sum
+RUR_Agg <- terra::aggregate(RUR_BP, fact=1, fun="mean")
+
+model_name <- c("RUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo")
+
+#Convert the raster to points
+RUR_Points <- terra::as.points(RUR_Agg)
+
+#Convert to a dataframe with coordinates and drop absences
+RUR_df <- st_as_sf(RUR_Points) %>%
+  dplyr::mutate(x = sf::st_coordinates(.)[,1],
+                y = sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  filter(RUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo %in% c(2, 3, 4)) %>%
+  rename(Likelihood = RUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo) %>%
+  mutate(Likelihood = factor(Likelihood,
+                             levels = c(2, 3, 4),
+                             labels = c("Few", "Many", "Abundant")))
+
+
+RUR_RA_Map <- ggplot() +
+  geom_sf(data = land_sf, fill = "grey80", color = NA) +
+  geom_point(data = RUR_df, aes(x = x, y = y, color = Likelihood), size = 0.3, alpha = 0.2) +
+  scale_color_manual(
+    name = "Relative Density",
+    values = c("Few" = "#f8b4b2", "Many" = "#e6360F", "Abundant"='#760b08')
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(
+    location = "bl", which_north = "true",
+    pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+    style = north_arrow_fancy_orienteering
+  ) +
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)) + 
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))  
+
+  
+RUR_RA_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_Relative_Map.png",   # or another path/filename
+  plot = RUR_RA_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+#Import one of my raster prediction layers
+RUR_BP <- RUR_Ordinal_Raster_Mask
+
+#Aggregate the raster based on sum
+RUR_Agg <- terra::aggregate(RUR_BP, fact=1, fun="mean")
+
+model_name <- c("RUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo")
+
+#Convert the raster to points
+RUR_Points <- terra::as.points(RUR_Agg)
+
+#Convert to a dataframe with coordinates and drop absences
+RUR_df <- st_as_sf(RUR_Points) %>%
+  dplyr::mutate(x = sf::st_coordinates(.)[,1],
+                y = sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  filter(RUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo %in% c(2, 3, 4)) %>%
+  rename(Likelihood = RUR_EMwmeanByF1_mergedData_mergedRun_mergedAlgo) %>%
+  mutate(Likelihood = factor(Likelihood,
+                             levels = c(2, 3, 4),
+                             labels = c("Few", "Many", "Abundant")))
+
+
+RUR_RA_Map <- ggplot() +
+  geom_sf(data = land_sf, fill = "grey80", color = NA) +
+  geom_point(data = RUR_df, aes(x = x, y = y, color = Likelihood), size = 0.3, alpha = 0.2) +
+  scale_color_manual(
+    name = "Relative Abundance",
+    values = c("Few" = "#f8b4b2", "Many" = "#760b08")
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(
+    location = "bl", which_north = "true",
+    pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+    style = north_arrow_fancy_orienteering
+  ) +
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),  # Remove default x/y axis lines
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),  # Clean black box
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)) + 
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))  
+  
+
+RUR_RA_Map
+
+```
+
+#Red urchin - rotated
+```{r}
+names(RUR_BP) <- "value"
+
+#Rotate green urchin points using the same rotation parameters
+RUR_df_rotated_coords <- rotate_points(
+  points = RUR_df[, c("x", "y")], 
+  angle_deg = rotation_angle, 
+  center = center
+)
+
+#Add rotated coordinates back to the dataframe
+RUR_df <- RUR_df %>%
+  dplyr::mutate(
+    x_rot = RUR_df_rotated_coords[,1],
+    y_rot = RUR_df_rotated_coords[,2]
+  )
+
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_BP)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_BP, coords_points)
+values_points <- extracted$value 
+
+
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+#Plot
+q <- ggplot() +
+  geom_point(data = RUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+  geom_point(data = RUR_df, aes(x = x_rot, y = y_rot, color = Likelihood), size = 0.3, alpha = 0.2) +
+  scale_color_manual(
+    name = "Relative Abundance",
+    values = c("Few" = "#f8b4b2", "Many" = "#e6360F","Abundant"='#760b08')
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)) + 
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_Relative_Map_Rotated.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+
+RUR_RA_Map <- q
+```
+
+```{r}
+#Plot
+q <- ggplot() +
+  geom_point(data = RUR_df_full, aes(x = x_rot, y = y_rot), color = "#e5e7e9", shape = 15, size = 0.3, alpha = 0.1) +  
+  geom_sf(data = land_rotated, fill = "white", color = 'black') +
+  geom_point(data = RUR_df, aes(x = x_rot, y = y_rot, color = Likelihood), size = 0.3, alpha = 0.2) +
+  scale_color_manual(
+    name = "Relative Abundance",
+    values = c("Few" = "#f8b4b2", "Many" = "#e6360F","Abundant"='#760b08')
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = c('top'),
+    legend.background = element_rect(fill = "white", color = NA)) + 
+    guides(color = guide_legend(override.aes = list(size = 4, alpha = 1))) +
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+q
+
+#Save 
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_Relative_Map_Rotated_outline.png",   # or another path/filename
+  plot = q,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+ 
+#Combined relative maps
+```{r}
+ra_combined_plot <- GUR_RA_Map + RUR_RA_Map + 
+  plot_layout(ncol = 2)  
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/Combined_RA_Map.png",   # or another path/filename
+  plot = ra_combined_plot,
+  width = 20,        
+  height = 16,       
+  dpi = 300            
+)
+
+```
+
+#Relative Abundance Uncertainty Maps ####
+```{r}
+#read in uncertainty 
+GUR_Uncertainty <-terra::rast("./processed_data/Uncertainty/GUR_Method_Uncertainty_RA.tif")
+
+#Adding buffer, rotated 
+GUR_points_full <- terra::as.points(GUR_Uncertainty)
+coords_points <- terra::crds(GUR_points_full)
+
+extracted <- terra::extract(GUR_Uncertainty, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+GUR_df_full <- st_as_sf(GUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = GUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+GUR_df_full <- GUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = GUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Uncertainty", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+    #legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave("./Plots/Maps/Uncertainty_Plots/GUR_Model_Uncertainty_Map_RA_Rotate.jpeg", plot = g, width = 10, height = 8, dpi = 300)
+
+GUR_Uncertainty_Plot  <- g
+```
+
+#red urchin 
+```{r}
+#read in uncertainty 
+RUR_Uncertainty <-terra::rast("./processed_data/Uncertainty/RUR_Method_Uncertainty_RA.tif")
+
+#Adding buffer, rotated 
+RUR_points_full <- terra::as.points(RUR_Uncertainty)
+coords_points <- terra::crds(RUR_points_full)
+
+extracted <- terra::extract(RUR_Uncertainty, coords_points)
+values_points <- extracted[[1]]  # this is usually the first and only column
+
+#build dataframe with coordinated values
+RUR_df_full <- st_as_sf(RUR_points_full) %>%
+  mutate(
+    x = sf::st_coordinates(.)[,1],
+    y = sf::st_coordinates(.)[,2],
+    value = values_points
+  ) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(value))
+
+#rotate coordinates
+rotated_coords <- rotate_points(
+  points = RUR_df_full[, c("x", "y")],
+  angle_deg = rotation_angle,
+  center = center
+)
+
+RUR_df_full <- RUR_df_full %>%
+  mutate(
+    x_rot = rotated_coords[,1],
+    y_rot = rotated_coords[,2]
+  )
+
+g <- ggplot() +
+  # raster points with value mapped to color
+  geom_point(
+    data = RUR_df_full,
+    aes(x = x_rot, y = y_rot, color = value),
+    shape = 15, size = 0.3, alpha = 0.7
+  ) +
+  
+  # rotated land layer
+  geom_sf(data = land_rotated, fill = "grey70", color = NA) +
+
+  # viridis continuous color scale for uncertainty
+  scale_color_viridis_c(name = "Uncertainty", option = "C") +
+
+  # coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+
+  # themes and styling
+  theme_minimal() + theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      legend.position = c(0.98, 0.98),   legend.justification = c("right", "top"),
+   # legend.background = element_rect(fill = "white", color = 'black')
+  ) +
+
+  # north arrow
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  )
+
+g
+
+ggsave("./Plots/Maps/Uncertainty_Plots/RUR_Model_Uncertainty_Map_RA_Rotate.jpeg", plot = g, width = 10, height = 8, dpi = 300)
+
+RUR_Uncertainty_Plot <- g
+```
+
+#combine RA uncertain
+```{r}
+RA_uncertainty_combined_plot <- GUR_Uncertainty_Plot + RUR_Uncertainty_Plot + 
+  plot_layout(ncol = 2)  
+
+RA_uncertainty_combined_plot
+
+ggsave(
+  filename = "./Plots/Maps/Uncertainty_Plots/Combined_RA_Uncertainty_Map.png",   # or another path/filename
+  plot = RA_uncertainty_combined_plot,
+  width = 20,        
+  height = 16,       
+  dpi = 300         
+)
+```
+
+#Combine all maps ####
+```{r}
+total_combined <- PUR_Point_Map + plot_spacer() +  plot_spacer() + GUR_Point_Map + GUR_Count_Map + GUR_RA_Map + RUR_Point_Map + RUR_Count_Map + RUR_RA_Map + 
+  plot_layout(ncol = 3, nrow = 3)  
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/Combined_Maps.png",   # or another path/filename
+  plot = total_combined,
+  width = 20,        
+  height = 16,       
+  dpi = 300            
+)
+```
+
+#Maps by species 
+```{r}
+green_combined<- GUR_Point_Map + GUR_Count_Map + GUR_RA_Map +  plot_layout(ncol = 3)  
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/Green_Maps.png",   # or another path/filename
+  plot = green_combined,
+  width = 20,        
+  height = 16,       
+  dpi = 300            
+)
+
+red_combined<- RUR_Point_Map + RUR_Count_Map + RUR_RA_Map +  plot_layout(ncol = 3)  
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/Red_Maps.png",   # or another path/filename
+  plot = red_combined,
+  width = 20,        
+  height = 16,       
+  dpi = 300            
+)
+
+
+
+```
+
+#Congruency Maps ####
+
+##Green urchin
+```{r}
+# Load and threshold rasters (stay as rasters for now!)
+GUR_Binary <- rast("./processed_data/Binary_Predictions/GUR_Binary_Predictions.tif")
+GUR_Count_Raster <- rast("./models_biomod/count/GUR/proj_GUR_current_count_ensembles/proj_GUR_current_count_ensembles_GUR_ensemble.tif")
+GUR_Count_Raster[GUR_Count_Raster > 0] <- 1  # convert all cells > 0 to 1
+
+GUR_Ordinal_Raster <- rast("./models_biomod/ordinal/GUR/proj_GUR_current_ord_ensembles/proj_GUR_current_ord_ensembles_GUR_ensemble.tif")
+GUR_Ordinal_Raster[GUR_Ordinal_Raster == 0] <- 0  # category 1 = None
+GUR_Ordinal_Raster[GUR_Ordinal_Raster > 0] <- 1  # anything above = presence
+
+# Your three binary rasters:
+r1 <- GUR_Binary
+r2 <- GUR_Count_Raster
+r3 <- GUR_Ordinal_Raster
+
+# Create logical presence/absence rasters
+p1 <- r1 == 1; p1[is.na(p1)] <- FALSE
+p2 <- r2 == 1; p2[is.na(p2)] <- FALSE
+p3 <- r3 == 1; p3[is.na(p3)] <- FALSE
+
+a1 <- r1 == 0; a1[is.na(a1)] <- FALSE
+a2 <- r2 == 0; a2[is.na(a2)] <- FALSE
+a3 <- r3 == 0; a3[is.na(a3)] <- FALSE
+
+# Sum presence and absence
+presence_sum <- p1 + p2 + p3
+absence_sum <- a1 + a2 + a3
+
+# Define agreement categories
+full_presence <- presence_sum == 3
+full_absence <- absence_sum == 3
+partial_presence <- presence_sum == 2 & absence_sum == 1
+partial_absence <- presence_sum == 1 & absence_sum == 2
+no_alignment <- is.na(presence_sum) | is.na(absence_sum)
+
+# Create an empty raster to hold alignment categories
+alignment_raster <- rast(r1)
+values(alignment_raster) <- NA
+
+# Assign category values
+values(alignment_raster)[which(values(full_presence) == 1)] <- 1
+values(alignment_raster)[which(values(full_absence) == 1)] <- 2
+values(alignment_raster)[which(values(partial_presence) == 1)] <- 3
+values(alignment_raster)[which(values(partial_absence) == 1)] <- 4
+values(alignment_raster)[which(values(no_alignment) == 1)] <- 5
+
+# Add category labels
+levels(alignment_raster) <- data.frame(
+  ID = 1:5,
+  category = c("full_presence", "full_absence", "partial_presence", "partial_absence", "no_alignment")
+)
+
+# Create buffer mask: include only where ALL models predict something (presence or absence)
+buffer_mask <- (p1 | a1) & (p2 | a2) & (p3 | a3)
+
+# Mask to buffer and optionally to bathymetry
+alignment_raster <- mask(alignment_raster, buffer_mask)
+alignment_raster <- mask(alignment_raster, Bathymetry)
+
+# Aggregate based on modal value (no-op if fact = 1)
+GUR_Agg <- terra::aggregate(alignment_raster, fact = 1, fun = "modal")
+
+# Convert to points
+GUR_Points <- terra::as.points(GUR_Agg)
+
+# Convert to dataframe and extract coordinates
+GUR_df <- st_as_sf(GUR_Points) %>%
+  dplyr::mutate(x = sf::st_coordinates(.)[,1],
+                y = sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+
+# Rotate point coordinates to match rotated land
+GUR_df[, c("x", "y")] <- rotate_points(GUR_df[, c("x", "y")], rotation_angle, center)
+
+# Plot
+GUR_Point_Map <- ggplot() +
+  geom_sf(data = land_rotated, fill = "grey80", color = NA) +
+  geom_point(data = GUR_df, aes(x = x, y = y, color = category), size = 0.0001, alpha = 0.1) +
+  scale_color_manual(
+    name = "",
+    values = c(
+      "full_presence" = "#ff7f00",
+      "partial_presence" = "#fdbf6f",
+      "partial_absence" = "#a6cee3",
+      "full_absence" = "#1f78b4"
+    )
+  ) +
+
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "none",
+    legend.background = element_rect(fill = "white", color = NA)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+GUR_Point_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_AlignPA_Map.png",   # or another path/filename
+  plot = GUR_Point_Map,
+  width = 10,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+##Red urchin
+```{r}
+# Load and threshold rasters (stay as rasters for now!)
+RUR_Binary <-terra::rast("./processed_data/Binary_Predictions/RUR_Binary_Predictions.tif")
+RUR_Count_Raster <- rast("./models_biomod/count/RUR/proj_RUR_current_count_ensembles/proj_RUR_current_count_ensembles_RUR_ensemble.tif")
+RUR_Count_Raster[RUR_Count_Raster > 0] <- 1  # convert all cells > 0 to 1
+
+RUR_Ordinal_Raster <- rast("./models_biomod/ordinal/RUR/proj_RUR_current_ord_ensembles/proj_RUR_current_ord_ensembles_RUR_ensemble.tif")
+RUR_Ordinal_Raster[RUR_Ordinal_Raster == 1] <- 0  # category 1 = None
+RUR_Ordinal_Raster[RUR_Ordinal_Raster >= 1] <- 1  # anything above = presence
+
+# Your three binary rasters:
+r1 <- RUR_Binary
+r2 <- RUR_Count_Raster
+r3 <- RUR_Ordinal_Raster
+
+# Create logical presence/absence rasters
+p1 <- r1 == 1; p1[is.na(p1)] <- FALSE
+p2 <- r2 == 1; p2[is.na(p2)] <- FALSE
+p3 <- r3 == 1; p3[is.na(p3)] <- FALSE
+
+a1 <- r1 == 0; a1[is.na(a1)] <- FALSE
+a2 <- r2 == 0; a2[is.na(a2)] <- FALSE
+a3 <- r3 == 0; a3[is.na(a3)] <- FALSE
+
+# Sum presence and absence
+presence_sum <- p1 + p2 + p3
+absence_sum <- a1 + a2 + a3
+
+# Define agreement categories
+full_presence <- presence_sum == 3
+full_absence <- absence_sum == 3
+partial_presence <- presence_sum == 2 & absence_sum == 1
+partial_absence <- presence_sum == 1 & absence_sum == 2
+no_alignment <- is.na(presence_sum) | is.na(absence_sum)
+
+# Create an empty raster to hold alignment categories
+alignment_raster <- rast(r1)
+values(alignment_raster) <- NA
+
+# Assign category values
+values(alignment_raster)[which(values(full_presence) == 1)] <- 1
+values(alignment_raster)[which(values(full_absence) == 1)] <- 2
+values(alignment_raster)[which(values(partial_presence) == 1)] <- 3
+values(alignment_raster)[which(values(partial_absence) == 1)] <- 4
+values(alignment_raster)[which(values(no_alignment) == 1)] <- 5
+
+# Add category labels
+levels(alignment_raster) <- data.frame(
+  ID = 1:5,
+  category = c("full_presence", "full_absence", "partial_presence", "partial_absence", "no_alignment")
+)
+
+# Create buffer mask: include only where ALL models predict something (presence or absence)
+buffer_mask <- (p1 | a1) & (p2 | a2) & (p3 | a3)
+
+# Mask to buffer and optionally to bathymetry
+alignment_raster <- mask(alignment_raster, buffer_mask)
+alignment_raster <- mask(alignment_raster, Bathymetry)
+
+# Aggregate based on modal value (no-op if fact = 1)
+RUR_Agg <- terra::aggregate(alignment_raster, fact = 1, fun = "modal")
+
+# Convert to points
+RUR_Points <- terra::as.points(RUR_Agg)
+
+# Convert to dataframe and extract coordinates
+RUR_df <- st_as_sf(RUR_Points) %>%
+  dplyr::mutate(x = sf::st_coordinates(.)[,1],
+                y = sf::st_coordinates(.)[,2]) %>%
+  st_drop_geometry()
+
+# Rotate point coordinates to match rotated land
+RUR_df[, c("x", "y")] <- rotate_points(RUR_df[, c("x", "y")], rotation_angle, center)
+
+# Plot
+RUR_Point_Map <- ggplot() +
+  geom_sf(data = land_rotated, fill = "grey80", color = NA) +
+  geom_point(data = RUR_df, aes(x = x, y = y, color = category), size = 0.0001, alpha = 0.1) +
+  scale_color_manual(
+    name = "",  # legend title
+    values = c(
+      "full_presence" = "#ff7f00",
+      "partial_presence" = "#fdbf6f",
+      "partial_absence" = "#a6cee3",
+      "full_absence" = "#1f78b4"
+    ),
+    breaks = c("full_presence", "partial_presence", "partial_absence", "full_absence"),
+    labels = c("Full Presence", "Partial Presence", "Partial Absence", "Full Absence")
+  ) +
+
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = NA)
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+RUR_Point_Map
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_AlignPA_Map.png",   # or another path/filename
+  plot = RUR_Point_Map,
+  width = 10,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+#Combine
+```{r}
+presenceabsence_combined<- GUR_Point_Map + RUR_Point_Map +  plot_layout(ncol = 2)  
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/Align_Presence_Absence_Maps.png",   # or another path/filename
+  plot = presenceabsence_combined,
+  width = 20,        
+  height = 16,       
+  dpi = 300            
+)
+```
+
+#Presence only alignment
+##Green urchin 
+```{r}
+
+#Converting binary to only presence
+GUR_Binary <-terra::rast("./processed_data/Binary_Predictions/GUR_Binary_Predictions.tif")
+GUR_Binary[GUR_Binary == 0] <- NA
+
+#Converting count to only presence (>0)
+GUR_Count_Raster <- rast("./models_biomod/count/GUR/proj_GUR_current_count_ensembles/proj_GUR_current_count_ensembles_GUR_ensemble.tif")
+GUR_Count_Raster[GUR_Count_Raster == 0] <- NA
+GUR_Count_Raster[GUR_Count_Raster >= 0] <- 1
+
+#Converting relative density to only presence (>None)
+GUR_Ordinal_Raster <- rast("./models_biomod/ordinal/GUR/proj_GUR_current_ord_ensembles/proj_GUR_current_ord_ensembles_GUR_ensemble.tif")
+GUR_Ordinal_Raster[GUR_Ordinal_Raster == 0] <- NA
+GUR_Ordinal_Raster[GUR_Ordinal_Raster >= 1] <- 1
+
+#Stack 
+GUR_stack <- c(GUR_Binary, GUR_Count_Raster, GUR_Ordinal_Raster)
+
+#Sum them cell-by-cell
+GUR_sum <- sum(GUR_stack, na.rm = FALSE)  # Only sum if all are not NA
+
+#Keep only cells where all 3 rasters agree on presence (i.e., value == 3)
+GUR_agreement <- GUR_sum == 3
+
+#Convert 0s to NA so only full-agreement areas show
+GUR_agreement[GUR_agreement == 0] <- NA
+
+# Convert raster to dataframe for plotting
+GUR_agreement_df <- as.data.frame(GUR_agreement, xy = TRUE, na.rm = TRUE)
+colnames(GUR_agreement_df) <- c("x", "y", "presence")
+
+GUR_Agreement_Map <- ggplot() +
+  geom_sf(data = land_sf, fill = "grey80", color = NA) +
+  geom_point(
+    data = GUR_agreement_df,
+    aes(x = x, y = y), 
+    size = 0.02, 
+    alpha = 0.3,
+    color = "#55C667FF"
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(
+    location = "bl", which_north = "true",
+    pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+    style = north_arrow_fancy_orienteering
+  ) +
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +
+  theme_cowplot() +
+  xlab(NULL) +
+  ylab(NULL) +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5)
+  )
+
+# Show the plot
+GUR_Agreement_Map
+
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/GUR_AlignPresence_Map.png",   # or another path/filename
+  plot = GUR_Agreement_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+
+##Red urchin 
+```{r}
+#Converting binary to only presence
+RUR_Binary <-terra::rast("./processed_data/Binary_Predictions/RUR_Binary_Predictions.tif")
+RUR_Binary[RUR_Binary == 0] <- NA
+
+#Converting count to only presence (>0)
+RUR_Count_Raster <- rast("./models_biomod/count/RUR/proj_RUR_current_count_ensembles/proj_RUR_current_count_ensembles_RUR_ensemble.tif")
+RUR_Count_Raster[RUR_Count_Raster == 0] <- NA
+RUR_Count_Raster[RUR_Count_Raster >= 0] <- 1
+
+#Converting relative density to only presence (>None)
+RUR_Ordinal_Raster <- rast("./models_biomod/ordinal/RUR/proj_RUR_current_ord_ensembles/proj_RUR_current_ord_ensembles_RUR_ensemble.tif")
+RUR_Ordinal_Raster[RUR_Ordinal_Raster == 1] <- NA
+RUR_Ordinal_Raster[RUR_Ordinal_Raster > 1] <- 1
+
+#Stack 
+RUR_stack <- c(RUR_Binary, RUR_Count_Raster, RUR_Ordinal_Raster)
+
+#Sum them cell-by-cell
+RUR_sum <- sum(RUR_stack, na.rm = FALSE)  # Only sum if all are not NA
+
+#Keep only cells where all 3 rasters agree on presence (i.e., value == 3)
+RUR_agreement <- RUR_sum == 3
+
+#Convert 0s to NA so only full-agreement areas show
+RUR_agreement[RUR_agreement == 0] <- NA
+
+# Convert raster to dataframe for plotting
+RUR_agreement_df <- as.data.frame(RUR_agreement, xy = TRUE, na.rm = TRUE)
+colnames(RUR_agreement_df) <- c("x", "y", "presence")
+
+RUR_Agreement_Map <- ggplot() +
+  geom_sf(data = land_sf, fill = "grey80", color = NA) +
+  geom_point(
+    data = RUR_agreement_df,
+    aes(x = x, y = y), 
+    size = 0.02, 
+    alpha = 0.3,
+    color = "#e6360F"
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(
+    location = "bl", which_north = "true",
+    pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"),
+    style = north_arrow_fancy_orienteering
+  ) +
+  coord_sf(crs = st_crs(3005), xlim = c(515000, 1255000), ylim = c(340000, 1100000)) +
+  theme_cowplot() +
+  xlab(NULL) +
+  ylab(NULL) +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5)
+  )
+
+# Show the plot
+RUR_Agreement_Map
+
+
+ggsave(
+  filename = "./Plots/Maps/Cluster_maps/RUR_AlignPresence_Map.png",   # or another path/filename
+  plot = RUR_Agreement_Map,
+  width = 6,        
+  height = 8,       
+  dpi = 300         
+)
+```
+#Mapping survey methods across datatypes
+```{r}
+#load libraries
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(cowplot)
+library(terra)
+library(sf)
+library(ggspatial)
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(forcats)
+library(patchwork)
+library(grid)
+
+#Read in different datasets #############
+presence_data <- read.csv("./processed_data/Survey_Datasets/presence_only.csv")
+RA_data <- read.csv("./processed_data/Survey_Datasets/relative_density.csv")
+count_data <- read.csv("./processed_data/Survey_Datasets/actual_density.csv")
+
+#Rename surveys - presence
+#Rename DFO surveys 
+presence_data <- presence_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("RSU_RESM", "RSU_RES", "RSU_RMS", "RSU_RBS", "RSU_RBB") ~ "DFO/RSU",
+    TRUE ~ survey_type
+  ))
+
+presence_data <- presence_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("GSU_GSS") ~ "DFO/GSU",
+    TRUE ~ survey_type
+  ))
+
+presence_data <- presence_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("DFO_MSP", "Multispecies_Multispecies", "DFO_MSP") ~ "DFO/MSP",
+    TRUE ~ survey_type
+  ))
+
+presence_data <- presence_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("DFO_BHM") ~ "DFO/BHM",
+    TRUE ~ survey_type
+  ))
+
+presence_data <- presence_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("RL_Survey") ~ "Reef_Life_Survey",
+    TRUE ~ survey_type
+  ))
+
+#Rename surveys - count
+count_data <- count_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("RSU_RESM", "RSU_RES", "RSU_RMS", "RSU_RBS", "RSU_RBB") ~ "DFO/RSU",
+    TRUE ~ survey_type
+  ))
+
+
+count_data <- count_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("GSU_GSS") ~ "DFO/GSU",
+    TRUE ~ survey_type
+  ))
+
+count_data <- count_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("DFO_MSP", "Multispecies_Multispecies", "DFO_MSP") ~ "DFO/MSP",
+    TRUE ~ survey_type
+  ))
+
+count_data <- count_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("DFO_BHM") ~ "DFO/BHM",
+    TRUE ~ survey_type
+  ))
+
+count_data <- count_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("RL_Survey") ~ "Reef_Life_Survey",
+    TRUE ~ survey_type
+  ))
+
+#Rename surveys - RA
+RA_data <- RA_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("RSU_RESM", "RSU_RES", "RSU_RMS", "RSU_RBS", "RSU_RBB") ~ "DFO/RSU",
+    TRUE ~ survey_type
+  ))
+
+RA_data <- RA_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("GSU_GSS") ~ "DFO/GSU",
+    TRUE ~ survey_type
+  ))
+
+RA_data <- RA_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("DFO_MSP", "Multispecies_Multispecies", "DFO_MSP") ~ "DFO/MSP",
+    TRUE ~ survey_type
+  ))
+
+RA_data <- RA_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("DFO_BHM") ~ "DFO/BHM",
+    TRUE ~ survey_type
+  ))
+
+RA_data <- RA_data %>%
+  mutate(survey_type = case_when(
+    survey_type %in% c("RL_Survey") ~ "Reef_Life_Survey",
+    TRUE ~ survey_type
+  ))
+
+
+
+#Load land file ############################
+#geographic layers
+Land <- terra::vect("./raw_data/BC_Buffer/Land.shp") 
+# Convert land to sf
+land_sf <- st_as_sf(Land)
+
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#Rotate shapefile function #########################
+rotate_sf <- function(sf_obj, angle_deg, center = NULL) {
+  angle_rad <- angle_deg * pi / 180
+  
+  #get centroid if center not provided
+  if (is.null(center)) {
+    center <- st_centroid(st_union(sf_obj))
+    center_coords <- st_coordinates(center)
+  } else {
+    center_coords <- center
+  }
+  
+  #apply rotation on each geometry separately
+  rotated_geoms <- lapply(st_geometry(sf_obj), function(geom) {
+    # Extract coordinates depending on geometry type
+    coords_list <- list()
+    
+    #handle POLYGON or MULTIPOLYGON
+    if (inherits(geom, "POLYGON")) {
+      coords_list <- list(geom)
+    } else if (inherits(geom, "MULTIPOLYGON")) {
+      coords_list <- geom
+    } else {
+      stop("Unsupported geometry type")
+    }
+    
+    #rotate each polygon (rings)
+    rotated_polygons <- lapply(coords_list, function(polygon) {
+      rotated_rings <- lapply(polygon, function(ring) {
+        # matrix of coordinates
+        coords <- ring
+        
+        # translate to origin (center)
+        coords_centered <- coords - matrix(center_coords, nrow = nrow(coords), ncol = 2, byrow = TRUE)
+        
+        # rotation matrix
+        rotation_matrix <- matrix(c(cos(angle_rad), -sin(angle_rad),
+                                    sin(angle_rad), cos(angle_rad)),
+                                  nrow = 2, byrow = TRUE)
+        
+        # rotate coords
+        rotated <- t(rotation_matrix %*% t(coords_centered))
+        
+        # translate back
+        rotated <- rotated + matrix(center_coords, nrow = nrow(rotated), ncol = 2, byrow = TRUE)
+        
+        # ensure polygon ring is closed: first point == last point
+        if (!all(rotated[1,] == rotated[nrow(rotated), ])) {
+          rotated <- rbind(rotated, rotated[1, ])
+        }
+        
+        return(rotated)
+      })
+      return(rotated_rings)
+    })
+    
+    #build new geometry with rotated polygons
+    if (inherits(geom, "POLYGON")) {
+      st_polygon(rotated_polygons[[1]])
+    } else if (inherits(geom, "MULTIPOLYGON")) {
+      st_multipolygon(rotated_polygons)
+    }
+  })
+  
+  #return sf with new rotated geometries
+  new_sf <- sf_obj
+  st_geometry(new_sf) <- st_sfc(rotated_geoms, crs = st_crs(sf_obj))
+  return(new_sf)
+}
+
+rotate_points <- function(points, angle_deg, center) {
+  angle_rad <- angle_deg * pi / 180
+  coords_centered <- as.matrix(points) - matrix(center, nrow = nrow(points), ncol = 2, byrow = TRUE)
+  rotation_matrix <- matrix(c(cos(angle_rad), -sin(angle_rad),
+                              sin(angle_rad), cos(angle_rad)),
+                            nrow = 2, byrow = TRUE)
+  rotated <- t(rotation_matrix %*% t(coords_centered))
+  rotated + matrix(center, nrow = nrow(points), ncol = 2, byrow = TRUE)
+}
+
+#Rotate land shapefile ###############
+rotation_angle <- -30
+
+#Rotate land
+land_rotated <- rotate_sf(land_sf, rotation_angle)
+
+#Define bounding box corners 
+coords <- data.frame(
+  x = c(1100000, 950000, 750000, 1300000),
+  y = c(950000, 1320000, 230000, 450000)
+)
+#Rotate bounding box corners around the same centroid
+#Use the centroid of land_sf for center of rotation
+center <- st_coordinates(st_centroid(st_union(land_sf)))
+
+rotated_bbox_coords <- rotate_points(coords, rotation_angle, center)
+
+xlim <- range(rotated_bbox_coords[,1])
+ylim <- range(rotated_bbox_coords[,2])
+
+
+x_center <- mean(rotated_bbox_coords[,1])
+y_range <- range(rotated_bbox_coords[,2])  # keep this unchanged
+
+#Define a new, narrower x-range (e.g., 300 km wide instead of full range)
+#Adjust the width to your liking
+x_half_width <- 300000  # in meters
+
+xlim <- c(x_center - x_half_width, x_center + x_half_width)
+ylim <- y_range  # unchanged
+
+#Shift center slightly left (e.g., by 75,000 m)
+x_center_adjusted <- x_center - 75000  # Try 50000, 75000, or 100000 as needed
+
+#keep the same x half-width
+xlim <- c(x_center_adjusted - x_half_width, x_center_adjusted + x_half_width)
+
+#plot the rotated land shapefile with rotated bounding box limits
+ggplot() +
+  geom_sf(data = land_rotated, fill = "grey70", color = "black") +
+  coord_sf(xlim = xlim, ylim = ylim) +
+  theme_minimal() +
+  labs(title = "Land shapefile rotated")
+
+
+#Rotated NORTH arrows
+#determining angle of north arrow
+arrow_x <- xlim[1] + 0.05 * diff(xlim)  # 5% in from the left
+arrow_y <- ylim[1] + 0.05 * diff(ylim)  # 5% up from the bottom
+
+arrow_length <- 50000  # arrow length in map units (e.g., meters)
+
+#Rotate arrow
+angle_deg <- 180 - (90 + (-rotation_angle))  
+angle_rad <- angle_deg * pi / 180
+
+#Endpoint of arrow
+end_x <- arrow_x + arrow_length * cos(angle_rad)
+end_y <- arrow_y + arrow_length * sin(angle_rad)
+
+#Make datasets into shapefiles and rotate ##########
+#PRESENCE 
+# Convert presence_data to sf if not already
+presence_sf <- st_as_sf(presence_data, coords = c("start_lon", "start_lat"), crs = 4326)
+presence_sf <- st_transform(presence_sf, crs = st_crs(land_sf))  # match CRS
+
+# Extract coordinates
+presence_coords <- st_coordinates(presence_sf)
+
+# Rotate coordinates around the land centroid
+center <- st_coordinates(st_centroid(st_union(land_sf)))
+rotated_coords <- rotate_points(presence_coords, rotation_angle, center)
+
+# Replace geometry with rotated coordinates
+presence_sf_rotated <- st_as_sf(
+  presence_sf %>% st_drop_geometry() %>% 
+    mutate(X_rot = rotated_coords[,1], Y_rot = rotated_coords[,2]),
+  coords = c("X_rot", "Y_rot"),
+  crs = st_crs(land_sf)
+)
+
+#COUNT 
+# Convert count_data to sf if not already
+count_sf <- st_as_sf(count_data, coords = c("start_lon", "start_lat"), crs = 4326)
+count_sf <- st_transform(count_sf, crs = st_crs(land_sf))  # match CRS
+
+# Extract coordinates
+count_coords <- st_coordinates(count_sf)
+
+# Rotate coordinates around the land centroid
+center <- st_coordinates(st_centroid(st_union(land_sf)))
+rotated_coords <- rotate_points(count_coords, rotation_angle, center)
+
+# Replace geometry with rotated coordinates
+count_sf_rotated <- st_as_sf(
+  count_sf %>% st_drop_geometry() %>% 
+    mutate(X_rot = rotated_coords[,1], Y_rot = rotated_coords[,2]),
+  coords = c("X_rot", "Y_rot"),
+  crs = st_crs(land_sf)
+)
+
+#RA
+# Convert RA_data to sf if not already
+RA_sf <- st_as_sf(RA_data, coords = c("start_lon", "start_lat"), crs = 4326)
+RA_sf <- st_transform(RA_sf, crs = st_crs(land_sf))  # match CRS
+
+# Extract coordinates
+RA_coords <- st_coordinates(RA_sf)
+
+# Rotate coordinates around the land centroid
+center <- st_coordinates(st_centroid(st_union(land_sf)))
+rotated_coords <- rotate_points(RA_coords, rotation_angle, center)
+
+# Replace geometry with rotated coordinates
+RA_sf_rotated <- st_as_sf(
+  RA_sf %>% st_drop_geometry() %>% 
+    mutate(X_rot = rotated_coords[,1], Y_rot = rotated_coords[,2]),
+  coords = c("X_rot", "Y_rot"),
+  crs = st_crs(land_sf)
+)
+
+#PLOTTING ################
+my_colors <- c(
+  "Baum_ROV" = "#1b9e77",
+  "Hakai" = "#d95f02",
+  "Reef_Life_Survey" = "#7570b3",
+  "DFO/RSU" = "#e7298a",
+  "DFO/GSU" = "#66a61e",
+  "DFO/BHM" = "#e6ab02",
+  "DFO/MSP" = "#1f78b4"
+)
+
+#PRESENCE
+# Rotated survey map
+Method_Point_Map<- ggplot() +
+  # Rotated land
+  geom_sf(data = land_rotated, fill = "grey80", color = NA) +
+  
+  # Rotated survey points
+  geom_sf(
+    data = presence_sf_rotated,
+    aes(color = survey_type),
+    size = 1,
+    alpha = 0.2
+  ) +
+  
+  # Color scale
+  scale_color_manual(name = "Survey Type", values = my_colors) +
+  
+  # North arrow and scale
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  
+  # Add rotated north arrow manually
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  ) +
+  
+  # Coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+  
+  # Styling
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "bottom",
+    legend.background = element_rect(fill = "white", color = NA)
+  )
+
+# Plot
+Method_Point_Map
+
+ggsave(
+  filename = "./Plots/Maps/Methods/Presence_Method_Point_Map.png",   # file name
+  plot = Method_Point_Map,             # the ggplot object
+  width = 10,                          # width in inches
+  height = 8,                          # height in inches
+  dpi = 300                            # resolution
+)
+
+#COUNT
+# Rotated survey map
+Method_Point_Map <- ggplot() +
+  # Rotated land
+  geom_sf(data = land_rotated, fill = "grey80", color = NA) +
+  
+  # Rotated survey points
+  geom_sf(
+    data = count_sf_rotated,
+    aes(color = survey_type),
+    size = 1,
+    alpha = 0.2
+  ) +
+  
+  # Color scale
+  scale_color_manual(name = "Survey Type", values = my_colors) +
+  
+  # North arrow and scale
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  
+  # Add rotated north arrow manually
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  ) +
+  
+  # Coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+  
+  # Styling
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "bottom",
+    legend.background = element_rect(fill = "white", color = NA)
+  )
+
+# Plot
+Method_Point_Map
+
+ggsave(
+  filename = "./Plots/Maps/Methods/Count_Method_Point_Map.png",   # file name
+  plot = Method_Point_Map,             # the ggplot object
+  width = 10,                          # width in inches
+  height = 8,                          # height in inches
+  dpi = 300                            # resolution
+)
+
+#RA
+#COUNT
+# Rotated survey map
+Method_Point_Map <- ggplot() +
+  # Rotated land
+  geom_sf(data = land_rotated, fill = "grey80", color = NA) +
+  
+  # Rotated survey points
+  geom_sf(
+    data = RA_sf_rotated,
+    aes(color = survey_type),
+    size = 1,
+    alpha = 0.2
+  ) +
+  
+  # Color scale
+  scale_color_manual(name = "Survey Type", values = my_colors) +
+  
+  # North arrow and scale
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  
+  # Add rotated north arrow manually
+  geom_segment(
+    aes(x = arrow_x, y = arrow_y, xend = end_x, yend = end_y),
+    arrow = arrow(length = unit(0.3, "cm")),
+    size = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = end_x + 20000 * cos(angle_rad),
+    y = end_y + 20000 * sin(angle_rad),
+    label = "N",
+    size = 5,
+    fontface = "bold"
+  ) +
+  
+  # Coordinate limits
+  coord_sf(xlim = xlim, ylim = ylim) +
+  
+  # Styling
+  theme_cowplot() +
+  xlab(NULL) + ylab(NULL) +
+  theme(
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 16),
+    axis.text.y = element_text(size = 16),
+    axis.line = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+    legend.position = "bottom",
+    legend.background = element_rect(fill = "white", color = NA)
+  )
+
+# Plot
+Method_Point_Map
+
+
+ggsave(
+  filename = "./Plots/Maps/Methods/RA_Method_Point_Map.png",   # file name
+  plot = Method_Point_Map,             # the ggplot object
+  width = 10,                          # width in inches
+  height = 8,                          # height in inches
+  dpi = 300                            # resolution
+)
+
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

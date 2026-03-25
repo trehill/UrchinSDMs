@@ -1,0 +1,488 @@
+---
+title: "Sampling_v_ENVspace"
+output: html_document
+date: "2025-01-22"
+---
+Involves loading in all transect metadata and creating spatial lines for each with a year associated to it.
+I will then have to split up transects by year and associate them with spatial predictor data from the year they were collected. I will then recombine all transect predictor data and compare it to the total environmental space of the hindcast climatology.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load required packages
+```{r}
+library(tidyverse)
+library(cowplot)
+library(tidyterra)
+library(ggspatial)
+library(terra)
+library(sf)
+library(tidync)
+library(factoextra)
+library(viridis)
+```
+
+PRESENCE DATA #############################
+#Load in data
+```{r}
+
+#Read in survey data 
+surveys <- read.csv("./processed_data/Survey_Datasets/presence_only.csv")
+
+```
+
+### Import all transect metadata, summarize to the transect level and combine into a single metadata file 
+  
+```{r}
+
+#Loop through the dataset and if the end lat and long are NA values set them to be slightly different than the start lat and long just so they can be represented as a very short line. 
+for (i in 1:nrow(surveys)){
+  if(is.na(surveys$end_lat[i])){
+    surveys$end_lat[i] <- surveys$start_lat[i] + 0.000001
+  }
+  if(is.na(surveys$end_lon[i])){
+    surveys$end_lon[i] <- surveys$start_lon[i] + 0.000001
+  }
+}
+
+#Select columns of interest
+data <- surveys %>% dplyr::select(survey_type, survey_id, year, start_lat, start_lon, end_lat, end_lon)
+
+
+#make distinct and remove NA values 
+Survey_Metadata <- data %>% distinct()%>% na.omit()
+
+```
+
+### Create spatial lines for each transect and associate each transect with its respective environmental conditions based on year
+```{r}
+#Create transect lines
+######
+#Import the North Coast subregion shapefile to use in masking the surveys
+BC_Mask <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project("epsg:3005")
+
+#Create a dataframe with all of the start and end points in long form
+Start_Points <- Survey_Metadata %>% dplyr::select(-end_lat, -end_lon)
+colnames(Start_Points) <- c("Survey_Type", "Transect_ID", "Year", "Lat", "Long")
+End_Points <- Survey_Metadata %>% dplyr::select(-start_lat, -start_lon)
+colnames(End_Points) <- c("Survey_Type", "Transect_ID", "Year", "Lat", "Long")
+Survey_Points <- rbind(Start_Points, End_Points)
+
+#Turn the above survey points into an sf dataframe using the lat and long values
+Survey_sf <- Survey_Points %>% sf::st_as_sf(coords = c("Long","Lat")) %>% sf::st_set_crs(4326)
+Survey_sf$Year <- as.numeric(Survey_sf$Year)
+#Cast this into linestrings grouped by Transect_ID
+Survey_Transects <- Survey_sf %>% dplyr::group_by(Transect_ID) %>% dplyr::summarize(Survey_year = mean(Year)) %>% dplyr::filter(sf::st_geometry_type(.) == "MULTIPOINT") %>% sf::st_cast("LINESTRING")
+
+#Look at all unique values of year 
+unique(Survey_Transects$Survey_year)
+
+#Set the column name back to year
+colnames(Survey_Transects)[2] <- "Year"
+#Look at all unique values of year 
+unique(Survey_Transects$Year)
+
+#Transform the surveys into a terra vector to mask the the north coast region and then backto an sf dataframe
+Survey_Transects_Vect <- terra::vect(Survey_Transects)%>% terra::project(crs(BC_Mask)) %>% terra::mask(BC_Mask)
+Survey_Transects <- sf::st_as_sf(Survey_Transects_Vect)
+
+#Look at all unique values of year now that surveys have been masked and create a list of these to be used moving forwards
+unique(Survey_Transects$Year)
+Year_list <- unique(floor(Survey_Transects$Year))
+
+######
+#Associate the transects with predictor data
+
+######
+#Load back in the BCCM resampled climatology
+Predictor_Hindcast_Climatologies <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_1993-2023.tif")
+
+#Create a dataframe to hold surveyed environmental conditions from each year
+Transect_Predictor_Data <- data.frame(matrix(ncol = length(names(Predictor_Hindcast_Climatologies)), nrow = 0))
+colnames(Transect_Predictor_Data) = names(Predictor_Hindcast_Climatologies)
+
+#For each year create and save an 8km buffer around completed surveys, load environmental layers and associate with survey locations, and add these values to a final dataframe of surveyed environmental conditions.
+for (i in 1:length(Year_list)) {
+  # Partition out surveys that occurred in this year
+  Transect_Year <- Survey_Transects_Vect %>% tidyterra::filter(Year == Year_list[i])
+  
+  # Create a buffer around these survey locations and save it for future use when generating pseudoabsence data
+  Survey_Buffer <- terra::buffer(Transect_Year, width = 8000, capstyle = "round", joinstyle = "round")
+  terra::writeVector(Survey_Buffer, paste0("./processed_data/Survey_Buffers/Survey_Buffer_", Year_list[i], ".shp"), overwrite = TRUE)
+  
+  # Determine the correct predictor year (use 2021 for 2022 and 2023)
+  predictor_year <- ifelse(Year_list[i] > 2021, 2021, floor(Year_list[i]))
+  
+  # Import the predictor layers for this year using predictor_year variable
+  Predictors <- terra::rast(paste0("./processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", predictor_year, ".tif")) %>% tidyterra::select(-Depth)
+  
+  # Extract predictor values for the surveys
+  Transect_Predictors <- terra::extract(x = Predictors, y = Transect_Year, fun = "mean", touches = TRUE, bind = TRUE) %>% terra::as.data.frame() %>% na.omit()
+  
+  # Append to the overall survey predictor dataframe
+  Transect_Predictor_Data <- rbind(Transect_Predictor_Data, Transect_Predictors)
+}
+
+Transect_Predictor_Data <- Transect_Predictor_Data %>% dplyr::select(-Transect_ID, -Year)
+
+```
+
+### Compare the sampled predictor space to that of the total hindcast climatology
+```{r}
+#Load in the hindcast climatology without depth and turn into a dataframe
+
+Hindcast_Predictor_Data <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif") %>% tidyterra::select(-Depth) %>% terra::as.data.frame() %>% na.omit()
+
+#Create a PCA for the total predictor space of the hindcast
+Hindcast_PCA <- princomp(scale(Hindcast_Predictor_Data))
+summary(Hindcast_PCA)
+
+
+#Generate a scree plot of the importance of each PC
+factoextra::fviz_eig(Hindcast_PCA, addlabels = TRUE)
+#Generate a quick biplot of the first two PCs in PCA-space
+fviz_pca_var(Hindcast_PCA, col.var = "black")
+#Generate a plot of Cos2 to represent how well each variable is represented in the PCA's first two PCs
+fviz_cos2(Hindcast_PCA, choice = "var", axes = 1:2)
+#Combine the two previous plots 
+fviz_pca_var(Hindcast_PCA, col.var = "cos2", gradient.cols = viridis(n=200), repel = TRUE)
+
+#Separate out the PCA scores
+Hindcast_Scores <- as.data.frame(Hindcast_PCA$scores)
+Hindcast_Scores$Type <- "Hindcast Predictor Space"
+
+#Project the environmental conditions of the transect surveys onto the PCA space
+Transect_Scores <- as.data.frame(predict(Hindcast_PCA, scale(Transect_Predictor_Data)))
+Transect_Scores$Type <- "Survey Predictor Space"
+
+#Rowbind all scores into a single dataframe for plotting
+All_Scores <- rbind(Hindcast_Scores, Transect_Scores)
+
+#Create a function that creates a frequency plot for the values of the study area and transect surveys for a specified principle component
+Density_Plot <- function(All_Scores, comp, title, x, y){
+  Dense <- ggplot(All_Scores) + geom_density(aes(x = All_Scores[,comp], fill = Type), alpha = 0.5) + scale_fill_manual(values = c("#404788FF", "#55C667FF"), name = "Feature Space" ) + xlab(title) + ylab("Frequency") + theme_classic() + guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank()) + theme(legend.position = c(x,y)) + theme(axis.text = element_text(size=12), axis.title = element_text(size = 14), legend.text = element_text(size = 8), legend.background = element_blank())
+  return(Dense)
+}
+
+#Plot grid a density plot for the first four principal components
+PCA_dense_plot <- plot_grid(Density_Plot(All_Scores, 1, "Principal Component 1 Value (##%)", 0.25, 0.81), Density_Plot(All_Scores, 2, "Principal Component 2 Value (##%)", 0.7, 0.81), Density_Plot(All_Scores, 3, "Principal Component 3 Value (##%)", 0.75, 0.81), Density_Plot(All_Scores, 4, "Principal Component 4 Value (##%)", 0.78, 0.81), nrow = 2)
+PCA_dense_plot
+ggsave2(filename = "./Plots/Predictor_Space/PA_Predictor_Hindcast_Transect_PCA_Density_Plot.jpeg", plot = PCA_dense_plot, scale = 1, height = 150, width = 225, units = "mm")
+
+#Create a PCA plot of the first two principal components of our hindcast and survey predictor space with no points but 95% elipses
+PCA_Plot_Ellipses <- ggplot(All_Scores) + scale_colour_manual( values = c("#404788FF", "#55C667FF")) + xlab("Principal Component 1 (##%)") + ylab("Principal Component 2 (##%)") + theme_classic() + guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank())+ theme(legend.position = "bottom", legend.justification = c("left","top"), legend.box.just = "right") + stat_ellipse(geom = "polygon", alpha = 0.2, aes(x = Comp.1, y = Comp.2, color = Type, group = Type, fill = Type)) + scale_fill_manual( values = c("#404788FF", "#55C667FF")) + theme(axis.text = element_text(size=14), axis.title = element_text(size = 18), legend.text = element_text(size = 16), legend.title = element_text(size= 18), legend.background = element_blank())
+PCA_Plot_Ellipses
+ggsave("./Plots/Predictor_Space/PA_Predictor_Hindcast_Transect_PCA_Plot_Ellipses.jpeg", PCA_Plot_Ellipses, units = "mm", width = 250, height = 150)
+```
+
+
+COUNT DATA #############################
+#Load in data
+```{r}
+
+#Read in survey data 
+surveys <- read.csv("./processed_data/Survey_Datasets/actual_density.csv")
+
+```
+
+### Import all transect metadata, summarize to the transect level and combine into a single metadata file 
+  
+```{r}
+
+#Loop through the dataset and if the end lat and long are NA values set them to be slightly different than the start lat and long just so they can be represented as a very short line. 
+for (i in 1:nrow(surveys)){
+  if(is.na(surveys$end_lat[i])){
+    surveys$end_lat[i] <- surveys$start_lat[i] + 0.000001
+  }
+  if(is.na(surveys$end_lon[i])){
+    surveys$end_lon[i] <- surveys$start_lon[i] + 0.000001
+  }
+}
+
+#Select columns of interest
+data <- surveys %>% dplyr::select(survey_type, survey_id, year, start_lat, start_lon, end_lat, end_lon)
+
+
+#make distinct and remove NA values 
+Survey_Metadata <- data %>% distinct()%>% na.omit()
+
+```
+
+### Create spatial lines for each transect and associate each transect with its respective environmental conditions based on year
+```{r}
+#Create transect lines
+######
+#Import the North Coast subregion shapefile to use in masking the surveys
+BC_Mask <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project("epsg:3005")
+
+#Create a dataframe with all of the start and end points in long form
+Start_Points <- Survey_Metadata %>% dplyr::select(-end_lat, -end_lon)
+colnames(Start_Points) <- c("Survey_Type", "Transect_ID", "Year", "Lat", "Long")
+End_Points <- Survey_Metadata %>% dplyr::select(-start_lat, -start_lon)
+colnames(End_Points) <- c("Survey_Type", "Transect_ID", "Year", "Lat", "Long")
+Survey_Points <- rbind(Start_Points, End_Points)
+
+#Turn the above survey points into an sf dataframe using the lat and long values
+Survey_sf <- Survey_Points %>% sf::st_as_sf(coords = c("Long","Lat")) %>% sf::st_set_crs(4326)
+Survey_sf$Year <- as.numeric(Survey_sf$Year)
+#Cast this into linestrings grouped by Transect_ID
+Survey_Transects <- Survey_sf %>% dplyr::group_by(Transect_ID) %>% dplyr::summarize(Survey_year = mean(Year)) %>% dplyr::filter(sf::st_geometry_type(.) == "MULTIPOINT") %>% sf::st_cast("LINESTRING")
+
+#Look at all unique values of year 
+unique(Survey_Transects$Survey_year)
+
+#Set the column name back to year
+colnames(Survey_Transects)[2] <- "Year"
+#Look at all unique values of year 
+unique(Survey_Transects$Year)
+
+#Transform the surveys into a terra vector to mask the the north coast region and then backto an sf dataframe
+Survey_Transects_Vect <- terra::vect(Survey_Transects)%>% terra::project(crs(BC_Mask)) %>% terra::mask(BC_Mask)
+Survey_Transects <- sf::st_as_sf(Survey_Transects_Vect)
+
+#Look at all unique values of year now that surveys have been masked and create a list of these to be used moving forwards
+unique(Survey_Transects$Year)
+Year_list <- unique(floor(Survey_Transects$Year))
+
+######
+#Associate the transects with predictor data
+
+######
+#Load back in the BCCM resampled climatology
+Predictor_Hindcast_Climatologies <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_1993-2023.tif")
+
+#Create a dataframe to hold surveyed environmental conditions from each year
+Transect_Predictor_Data <- data.frame(matrix(ncol = length(names(Predictor_Hindcast_Climatologies)), nrow = 0))
+colnames(Transect_Predictor_Data) = names(Predictor_Hindcast_Climatologies)
+
+#For each year create and save an 8km buffer around completed surveys, load environmental layers and associate with survey locations, and add these values to a final dataframe of surveyed environmental conditions.
+for (i in 1:length(Year_list)) {
+  # Partition out surveys that occurred in this year
+  Transect_Year <- Survey_Transects_Vect %>% tidyterra::filter(Year == Year_list[i])
+  
+  # Create a buffer around these survey locations and save it for future use when generating pseudoabsence data
+  #Survey_Buffer <- terra::buffer(Transect_Year, width = 8000, capstyle = "round", joinstyle = "round")
+  #terra::writeVector(Survey_Buffer, paste0("./processed_data/Survey_Buffers/Survey_Buffer_", Year_list[i], ".shp"), overwrite = TRUE)
+  
+  # Determine the correct predictor year (use 2021 for 2022 and 2023)
+  predictor_year <- ifelse(Year_list[i] > 2021, 2021, floor(Year_list[i]))
+  
+  # Import the predictor layers for this year using predictor_year variable
+  Predictors <- terra::rast(paste0("./processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", predictor_year, ".tif")) %>% tidyterra::select(-Depth)
+  
+  # Extract predictor values for the surveys
+  Transect_Predictors <- terra::extract(x = Predictors, y = Transect_Year, fun = "mean", touches = TRUE, bind = TRUE) %>% terra::as.data.frame() %>% na.omit()
+  
+  # Append to the overall survey predictor dataframe
+  Transect_Predictor_Data <- rbind(Transect_Predictor_Data, Transect_Predictors)
+}
+
+Transect_Predictor_Data <- Transect_Predictor_Data %>% dplyr::select(-Transect_ID, -Year)
+
+```
+
+### Compare the sampled predictor space to that of the total hindcast climatology
+```{r}
+#Load in the hindcast climatology without depth and turn into a dataframe
+
+Hindcast_Predictor_Data <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif") %>% tidyterra::select(-Depth) %>% terra::as.data.frame() %>% na.omit()
+
+#Create a PCA for the total predictor space of the hindcast
+Hindcast_PCA <- princomp(scale(Hindcast_Predictor_Data))
+summary(Hindcast_PCA)
+
+
+#Generate a scree plot of the importance of each PC
+factoextra::fviz_eig(Hindcast_PCA, addlabels = TRUE)
+#Generate a quick biplot of the first two PCs in PCA-space
+fviz_pca_var(Hindcast_PCA, col.var = "black")
+#Generate a plot of Cos2 to represent how well each variable is represented in the PCA's first two PCs
+fviz_cos2(Hindcast_PCA, choice = "var", axes = 1:2)
+#Combine the two previous plots 
+fviz_pca_var(Hindcast_PCA, col.var = "cos2", gradient.cols = viridis(n=200), repel = TRUE)
+
+#Separate out the PCA scores
+Hindcast_Scores <- as.data.frame(Hindcast_PCA$scores)
+Hindcast_Scores$Type <- "Hindcast Predictor Space"
+
+#Project the environmental conditions of the transect surveys onto the PCA space
+Transect_Scores <- as.data.frame(predict(Hindcast_PCA, scale(Transect_Predictor_Data)))
+Transect_Scores$Type <- "Survey Predictor Space"
+
+#Rowbind all scores into a single dataframe for plotting
+All_Scores <- rbind(Hindcast_Scores, Transect_Scores)
+
+#Create a function that creates a frequency plot for the values of the study area and transect surveys for a specified principle component
+Density_Plot <- function(All_Scores, comp, title, x, y){
+  Dense <- ggplot(All_Scores) + geom_density(aes(x = All_Scores[,comp], fill = Type), alpha = 0.5) + scale_fill_manual(values = c("#404788FF", "#55C667FF"), name = "Feature Space" ) + xlab(title) + ylab("Frequency") + theme_classic() + guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank()) + theme(legend.position = c(x,y)) + theme(axis.text = element_text(size=12), axis.title = element_text(size = 14), legend.text = element_text(size = 8), legend.background = element_blank())
+  return(Dense)
+}
+
+#Plot grid a density plot for the first four principal components
+PCA_dense_plot <- plot_grid(Density_Plot(All_Scores, 1, "Principal Component 1 Value (##%)", 0.25, 0.81), Density_Plot(All_Scores, 2, "Principal Component 2 Value (##%)", 0.7, 0.81), Density_Plot(All_Scores, 3, "Principal Component 3 Value (##%)", 0.75, 0.81), Density_Plot(All_Scores, 4, "Principal Component 4 Value (##%)", 0.78, 0.81), nrow = 2)
+PCA_dense_plot
+ggsave2(filename = "./Plots/Predictor_Space/AD_Predictor_Hindcast_Transect_PCA_Density_Plot.jpeg", plot = PCA_dense_plot, scale = 1, height = 150, width = 225, units = "mm")
+
+#Create a PCA plot of the first two principal components of our hindcast and survey predictor space with no points but 95% elipses
+PCA_Plot_Ellipses <- ggplot(All_Scores) + scale_colour_manual( values = c("#404788FF", "#55C667FF")) + xlab("Principal Component 1 (##%)") + ylab("Principal Component 2 (##%)") + theme_classic() + guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank())+ theme(legend.position = "bottom", legend.justification = c("left","top"), legend.box.just = "right") + stat_ellipse(geom = "polygon", alpha = 0.2, aes(x = Comp.1, y = Comp.2, color = Type, group = Type, fill = Type)) + scale_fill_manual( values = c("#404788FF", "#55C667FF")) + theme(axis.text = element_text(size=14), axis.title = element_text(size = 18), legend.text = element_text(size = 16), legend.title = element_text(size= 18), legend.background = element_blank())
+PCA_Plot_Ellipses
+ggsave("./Plots/Predictor_Space/AD_Predictor_Hindcast_Transect_PCA_Plot_Ellipses.jpeg", PCA_Plot_Ellipses, units = "mm", width = 250, height = 150)
+```
+
+
+#RELATIVE DENSITY DATA #########
+#Load in data
+```{r}
+
+#Read in survey data 
+surveys <- read.csv("./processed_data/Survey_Datasets/relative_density.csv")
+
+```
+
+### Import all transect metadata, summarize to the transect level and combine into a single metadata file 
+  
+```{r}
+
+#Loop through the dataset and if the end lat and long are NA values set them to be slightly different than the start lat and long just so they can be represented as a very short line. 
+for (i in 1:nrow(surveys)){
+  if(is.na(surveys$end_lat[i])){
+    surveys$end_lat[i] <- surveys$start_lat[i] + 0.000001
+  }
+  if(is.na(surveys$end_lon[i])){
+    surveys$end_lon[i] <- surveys$start_lon[i] + 0.000001
+  }
+}
+
+#Select columns of interest
+data <- surveys %>% dplyr::select(survey_type, survey_id, year, start_lat, start_lon, end_lat, end_lon)
+
+
+#make distinct and remove NA values 
+Survey_Metadata <- data %>% distinct()%>% na.omit()
+
+```
+
+### Create spatial lines for each transect and associate each transect with its respective environmental conditions based on year
+```{r}
+#Create transect lines
+######
+#Import the North Coast subregion shapefile to use in masking the surveys
+BC_Mask <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project("epsg:3005")
+
+#Create a dataframe with all of the start and end points in long form
+Start_Points <- Survey_Metadata %>% dplyr::select(-end_lat, -end_lon)
+colnames(Start_Points) <- c("Survey_Type", "Transect_ID", "Year", "Lat", "Long")
+End_Points <- Survey_Metadata %>% dplyr::select(-start_lat, -start_lon)
+colnames(End_Points) <- c("Survey_Type", "Transect_ID", "Year", "Lat", "Long")
+Survey_Points <- rbind(Start_Points, End_Points)
+
+#Turn the above survey points into an sf dataframe using the lat and long values
+Survey_sf <- Survey_Points %>% sf::st_as_sf(coords = c("Long","Lat")) %>% sf::st_set_crs(4326)
+Survey_sf$Year <- as.numeric(Survey_sf$Year)
+#Cast this into linestrings grouped by Transect_ID
+Survey_Transects <- Survey_sf %>% dplyr::group_by(Transect_ID) %>% dplyr::summarize(Survey_year = mean(Year)) %>% dplyr::filter(sf::st_geometry_type(.) == "MULTIPOINT") %>% sf::st_cast("LINESTRING")
+
+#Look at all unique values of year 
+unique(Survey_Transects$Survey_year)
+
+#Set the column name back to year
+colnames(Survey_Transects)[2] <- "Year"
+#Look at all unique values of year 
+unique(Survey_Transects$Year)
+
+#Transform the surveys into a terra vector to mask the the north coast region and then backto an sf dataframe
+Survey_Transects_Vect <- terra::vect(Survey_Transects)%>% terra::project(crs(BC_Mask)) %>% terra::mask(BC_Mask)
+Survey_Transects <- sf::st_as_sf(Survey_Transects_Vect)
+
+#Look at all unique values of year now that surveys have been masked and create a list of these to be used moving forwards
+unique(Survey_Transects$Year)
+Year_list <- unique(floor(Survey_Transects$Year))
+
+######
+#Associate the transects with predictor data
+
+######
+#Load back in the BCCM resampled climatology
+Predictor_Hindcast_Climatologies <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_1993-2023.tif")
+
+#Create a dataframe to hold surveyed environmental conditions from each year
+Transect_Predictor_Data <- data.frame(matrix(ncol = length(names(Predictor_Hindcast_Climatologies)), nrow = 0))
+colnames(Transect_Predictor_Data) = names(Predictor_Hindcast_Climatologies)
+
+#For each year create and save an 8km buffer around completed surveys, load environmental layers and associate with survey locations, and add these values to a final dataframe of surveyed environmental conditions.
+for (i in 1:length(Year_list)) {
+  # Partition out surveys that occurred in this year
+  Transect_Year <- Survey_Transects_Vect %>% tidyterra::filter(Year == Year_list[i])
+  
+  # Create a buffer around these survey locations and save it for future use when generating pseudoabsence data
+#  Survey_Buffer <- terra::buffer(Transect_Year, width = 8000, capstyle = "round", joinstyle = "round")
+#  terra::writeVector(Survey_Buffer, paste0("./processed_data/Survey_Buffers/Survey_Buffer_", Year_list[i], ".shp"), overwrite = TRUE)
+  
+  # Determine the correct predictor year (use 2021 for 2022 and 2023)
+  predictor_year <- ifelse(Year_list[i] > 2021, 2021, floor(Year_list[i]))
+  
+  # Import the predictor layers for this year using predictor_year variable
+  Predictors <- terra::rast(paste0("./processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", predictor_year, ".tif")) %>% tidyterra::select(-Depth)
+  
+  # Extract predictor values for the surveys
+  Transect_Predictors <- terra::extract(x = Predictors, y = Transect_Year, fun = "mean", touches = TRUE, bind = TRUE) %>% terra::as.data.frame() %>% na.omit()
+  
+  # Append to the overall survey predictor dataframe
+  Transect_Predictor_Data <- rbind(Transect_Predictor_Data, Transect_Predictors)
+}
+
+Transect_Predictor_Data <- Transect_Predictor_Data %>% dplyr::select(-Transect_ID, -Year)
+
+```
+
+### Compare the sampled predictor space to that of the total hindcast climatology
+```{r}
+#Load in the hindcast climatology without depth and turn into a dataframe
+
+Hindcast_Predictor_Data <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif") %>% tidyterra::select(-Depth) %>% terra::as.data.frame() %>% na.omit()
+
+#Create a PCA for the total predictor space of the hindcast
+Hindcast_PCA <- princomp(scale(Hindcast_Predictor_Data))
+summary(Hindcast_PCA)
+
+
+#Generate a scree plot of the importance of each PC
+factoextra::fviz_eig(Hindcast_PCA, addlabels = TRUE)
+#Generate a quick biplot of the first two PCs in PCA-space
+fviz_pca_var(Hindcast_PCA, col.var = "black")
+#Generate a plot of Cos2 to represent how well each variable is represented in the PCA's first two PCs
+fviz_cos2(Hindcast_PCA, choice = "var", axes = 1:2)
+#Combine the two previous plots 
+fviz_pca_var(Hindcast_PCA, col.var = "cos2", gradient.cols = viridis(n=200), repel = TRUE)
+
+#Separate out the PCA scores
+Hindcast_Scores <- as.data.frame(Hindcast_PCA$scores)
+Hindcast_Scores$Type <- "Hindcast Predictor Space"
+
+#Project the environmental conditions of the transect surveys onto the PCA space
+Transect_Scores <- as.data.frame(predict(Hindcast_PCA, scale(Transect_Predictor_Data)))
+Transect_Scores$Type <- "Survey Predictor Space"
+
+#Rowbind all scores into a single dataframe for plotting
+All_Scores <- rbind(Hindcast_Scores, Transect_Scores)
+
+#Create a function that creates a frequency plot for the values of the study area and transect surveys for a specified principle component
+Density_Plot <- function(All_Scores, comp, title, x, y){
+  Dense <- ggplot(All_Scores) + geom_density(aes(x = All_Scores[,comp], fill = Type), alpha = 0.5) + scale_fill_manual(values = c("#404788FF", "#55C667FF"), name = "Feature Space" ) + xlab(title) + ylab("Frequency") + theme_classic() + guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank()) + theme(legend.position = c(x,y)) + theme(axis.text = element_text(size=12), axis.title = element_text(size = 14), legend.text = element_text(size = 8), legend.background = element_blank())
+  return(Dense)
+}
+
+#Plot grid a density plot for the first four principal components
+PCA_dense_plot <- plot_grid(Density_Plot(All_Scores, 1, "Principal Component 1 Value (##%)", 0.25, 0.81), Density_Plot(All_Scores, 2, "Principal Component 2 Value (##%)", 0.7, 0.81), Density_Plot(All_Scores, 3, "Principal Component 3 Value (##%)", 0.75, 0.81), Density_Plot(All_Scores, 4, "Principal Component 4 Value (##%)", 0.78, 0.81), nrow = 2)
+PCA_dense_plot
+ggsave2(filename = "./Plots/Predictor_Space/RD_Predictor_Hindcast_Transect_PCA_Density_Plot.jpeg", plot = PCA_dense_plot, scale = 1, height = 150, width = 225, units = "mm")
+
+#Create a PCA plot of the first two principal components of our hindcast and survey predictor space with no points but 95% elipses
+PCA_Plot_Ellipses <- ggplot(All_Scores) + scale_colour_manual( values = c("#404788FF", "#55C667FF")) + xlab("Principal Component 1 (#%)") + ylab("Principal Component 2 (#%)") + theme_classic() + guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank())+ theme(legend.position = "bottom", legend.justification = c("left","top"), legend.box.just = "right") + stat_ellipse(geom = "polygon", alpha = 0.2, aes(x = Comp.1, y = Comp.2, color = Type, group = Type, fill = Type)) + scale_fill_manual( values = c("#404788FF", "#55C667FF")) + theme(axis.text = element_text(size=14), axis.title = element_text(size = 18), legend.text = element_text(size = 16), legend.title = element_text(size= 18), legend.background = element_blank())
+PCA_Plot_Ellipses
+ggsave("./Plots/Predictor_Space/RD_Predictor_Hindcast_Transect_PCA_Plot_Ellipses.jpeg", PCA_Plot_Ellipses, units = "mm", width = 250, height = 150)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+

@@ -1,0 +1,618 @@
+---
+title: "Green Urchin LO"
+author: "Matt Csordas" and "Tessa Rehill" 
+date: "2024-12-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This Rmarkdown file runs through the species distribution modeling process for Green urchins from dataset creation to final model evaluation and interpretation
+
+GUR = Green urchin
+
+#Install the flexsdm package
+```{r}
+# For Windows and Mac OS operating systems
+#remotes::install_github("sjevelazco/flexsdm")
+```
+
+# Load all necessary packages
+```{r}
+library(tidyverse)
+library(terra)
+library(sf)
+library(cowplot)
+library(tidyterra)
+library(ggspatial)
+library(blockCV)
+library(gbm)
+library(dismo)
+library(mop)
+library(foreach)
+library(doParallel)
+library(caret)
+library(CAST)
+library(viridis)
+library(ggExtra)
+library(gridExtra)
+library(flexsdm)
+library(kernlab)
+library(mgcv)
+library(enmSdmX)
+```
+
+# Data preparation
+
+## Load all initally required datasets
+```{r}
+#Load general functions and general spatial mapping plotting scripts 
+source("General_Functions.R")
+source("Spatial_Mapping_Functions_flexSDM.R")
+
+#Load the BC buffer used to ensure all training data is contained within BC
+BC_Buffer <- terra::vect("./raw_data/BC_Buffer/BC_Buffer.shp") %>% terra::project(terra::crs("epsg:3005"))
+
+#Import the shapefile we will be using to represent land/the coastline and project to the correct crs/mask to NC
+Coastline <- vect("./raw_data/BC_Buffer/GSHHS_f_L1.shp") %>% terra::project("epsg:3005")
+Land <- Coastline %>% terra::mask(BC_Buffer)
+
+#Load in the prepped presence data from DFO transect surveys
+Urchin_Transects_Filtered <- sf::st_read("./processed_data/Urchin_Presence/Urchin_Occurrence_Transects_Filtered.shp")
+colnames(Urchin_Transects_Filtered)[4] <- "Year"
+colnames(Urchin_Transects_Filtered)[11] <- "Species"
+```
+
+## Create the final presence dataset for GUR
+```{r}
+#Load in the scripts containing functions we will use to do this
+source("Presence_Point_Creator.R")
+source("Presence_Map_Creator.R")
+
+#Generate a list of years for which occurrence data is available for GUR
+GUR_Year_list <- unique((Urchin_Transects_Filtered %>% dplyr::filter(Species == "GUR"))$Year)
+
+#Load bathymetry layer
+Bathymetry <- terra::rast("./processed_data/ENV_layers/DEM_100.tif")
+
+#For each year in the GUR year list generate presence points, a presence raster, and a map of where presences were observed
+for (i in 1:length(GUR_Year_list)){
+  GUR_Output <- Point_Creator(Urchin_Transects_Filtered %>% dplyr::filter(Year == GUR_Year_list[i]), "GUR", Bathymetry)
+  GUR_Presence_Points <- GUR_Output[[2]]
+  GUR_Raster <- GUR_Output[[1]]
+  
+  terra::writeVector(GUR_Presence_Points, paste0("./processed_data/Urchin_Presence/GUR_Presence_Points_", GUR_Year_list[i],".shp"), overwrite = TRUE)
+  terra::writeRaster(GUR_Raster, paste0("./processed_data/Urchin_Presence/GUR_Presence_Raster_", GUR_Year_list[i], ".tif"), overwrite = TRUE)
+  GUR_Pres_Map <- Pres_Map_GUR(Land, GUR_Presence_Points %>% terra::project(crs(Land)))
+  ggsave(paste0("./Plots/Maps/Species_Presence_Maps/GUR_Pres_Map_", GUR_Year_list[i], ".jpeg"), GUR_Pres_Map, units = "mm", width = 120, height = 140)
+  print(i)
+}
+
+#Do the same for the entire time period 
+GUR_Output <- Point_Creator(Urchin_Transects_Filtered, "GUR", Bathymetry)
+GUR_Presence_Points <- GUR_Output[[2]]
+GUR_Raster <- GUR_Output[[1]]
+terra::writeVector(GUR_Presence_Points, "./processed_data/Urchin_Presence/GUR_Presence_Points.shp", overwrite = TRUE)
+terra::writeRaster(GUR_Raster, "./processed_data/Urchin_Presence/GUR_Presence_Raster.tif", overwrite = TRUE)
+
+GUR_Pres_Map <- Pres_Map_GUR(Land, GUR_Presence_Points %>% terra::project(crs(Land)))
+ggsave("./Plots/Maps/Species_Presence_Maps/GUR_Pres_Map.jpeg", GUR_Pres_Map, units = "mm", width = 120, height = 140)
+```
+
+## Generate pseudo-absences for each year, associate all data points with their environmental conditions, and output the final training dataset
+```{r}
+gc()
+#Load all of the required scripts containing functions to do this
+source("Pseudo-absence_Creator_flexSDM.R")
+
+#Set up lists to hold the environmental rasters/dataframes, survey locations, and species presence points/rasters for each year
+Enviro_list <- list()
+Enviro_df_list <- list()
+Enviro_df_mask_list <- list()
+Enviro_df_long_list <- list()
+Buffer_list <- list()
+GUR_point_list <- list()
+GUR_rast_list <- list()
+
+#Load the environmental layers, survey buffers, and species presence points from each relevant year of the hindcast. In the loop create masked environmental dataframes for each year of data based on a buffer around survey locations from that year.
+for (i in 1:length(GUR_Year_list)){
+  #Load the environmental layers for year i
+Enviro_list[[i]] <- terra::rast(paste0("./processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", GUR_Year_list[i], ".tif"))[[names(terra::rast(paste0("./processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", GUR_Year_list[i], ".tif")))[!grepl("Depth", names(terra::rast(paste0("./processed_data/ENV_layers/BCCM_Rasters/Predictor_hindcast_climatology_", GUR_Year_list[i], ".tif"))))]]]
+
+  #Load the survey buffers for year i
+  Buffer_list[[i]] <- terra::vect(paste0("./processed_data/Survey_Buffers/Survey_Buffer_", GUR_Year_list[i], ".shp"))
+  #Create an environmental dataframe for year i
+   Enviro_df_list[[i]] <- terra::as.data.frame(Enviro_list[[i]], xy = TRUE) %>% na.omit()
+  #Create a long-form version of the above dataframe where instead of a column for each predictor there is a column    denoting which values are for which predictor
+  Enviro_df_long_list[[i]] <- Enviro_df_list[[i]] %>% pivot_longer(cols = everything(), names_to = "Type", values_to = "Value")
+  Enviro_df_long_list[[i]]$DataType <- "BC-wide"
+  #Create a masked environmental dataframe based on the survey locations in year i
+  Enviro_df_mask_list[[i]] <- terra::as.data.frame(terra::mask(Enviro_list[[i]], Buffer_list[[i]]), xy=TRUE) %>% na.omit()
+  #Load in species presence points and rasters
+  GUR_point_list[[i]] <- terra::vect(paste0("./processed_data/Urchin_Presence/GUR_Presence_Points_", GUR_Year_list[i], ".shp")) %>% terra::mask(BC_Buffer)
+  GUR_rast_list[[i]] <- terra::rast(paste0("./processed_data/Urchin_Presence/GUR_Presence_Raster_", GUR_Year_list[i], ".tif")) %>% terra::mask(BC_Buffer)
+  gc()
+}
+
+#Generate pseudo-absence points for each year of data for GUR
+#Read in the overall GUR Presence Raster
+GUR_Pres_Rast <- terra::rast("./processed_data/Urchin_Presence/GUR_Presence_Raster.tif")
+
+#Set up a list to hold the data
+GUR_PA_list <- list()
+#Generate PA_num sets of presence-pseudoabsence points for each year
+#for (i in 1:length(GUR_Year_list)){
+#  GUR_PA_list[[i]] <- PA_Creation(GUR_rast_list[[i]], GUR_point_list[[i]], GUR_Pres_Rast, Enviro_df_mask_list[[i]], dim(GUR_point_list[[i]])[1])
+#}
+
+#select PA outside of survey buffers 
+for (i in 1:length(GUR_Year_list)){
+  GUR_PA_list[[i]] <- PA_Creation(GUR_rast_list[[i]], GUR_point_list[[i]], GUR_Pres_Rast, Enviro_df_list[[i]], dim(GUR_point_list[[i]])[1])
+}
+
+```
+
+## Associate presence/pseudo-absence datasets with the appropriate training predictors and combine data from across years into one final dataset for each PA dataset created
+```{r}
+#Associate all data with environmental data from the appropriate location and year
+GUR_PA_Enviro_List <- list()
+for (i in 1:length(GUR_PA_list)){
+  GUR_PA_Enviro_List[[i]] <- terra::extract(x = Enviro_list[[i]], y = GUR_PA_list[[i]], method = "simple", bind = TRUE) %>% terra::na.omit("")
+}
+
+#Combine independent years of data together for each PA dataset so that there is one final dataset for each 
+GUR_training_data <- GUR_PA_Enviro_List[[1]]
+for (j in 2:length(GUR_PA_Enviro_List)){
+  GUR_training_data <- rbind(GUR_training_data, GUR_PA_Enviro_List[[j]])
+}
+
+
+
+```
+
+#Save as RDS (for inputs into the Alliance)
+```{r}
+#Save
+# Save R objects to .rds files
+saveRDS(Enviro_list, "outputs/GUR_Enviro_list.rds")
+saveRDS(Enviro_df_list, "outputs/GUR_Enviro_df_list.rds")
+saveRDS(Enviro_df_mask_list, "outputs/GUR_Enviro_df_mask_list.rds")
+saveRDS(Enviro_df_long_list, "outputs/GUR_Enviro_df_long_list.rds")
+saveRDS(Buffer_list, "outputs/GUR_Buffer_list.rds")
+saveRDS(GUR_point_list, "outputs/GUR_point_list.rds")
+saveRDS(GUR_rast_list, "outputs/GUR_rast_list.rds")
+saveRDS(GUR_PA_list, "outputs/GUR_PA_list.rds")
+saveRDS(GUR_PA_Enviro_List, "outputs/GUR_PA_Enviro_List.rds")
+saveRDS(GUR_training_data, "outputs/GUR_training_data.rds")
+
+
+# Load previously saved data objects
+Enviro_list <- readRDS("outputs/GUR_Enviro_list.rds")
+Enviro_df_list <- readRDS("outputs/GUR_Enviro_df_list.rds")
+Enviro_df_mask_list <- readRDS("outputs/GUR_Enviro_df_mask_list.rds")
+Enviro_df_long_list <- readRDS("outputs/GUR_Enviro_df_long_list.rds")
+Buffer_list <- readRDS("outputs/GUR_Buffer_list.rds")
+GUR_point_list <- readRDS("outputs/GUR_point_list.rds")
+GUR_rast_list <- readRDS("outputs/GUR_rast_list.rds")
+GUR_PA_list <- readRDS("outputs/GUR_PA_list.rds")
+GUR_PA_Enviro_List <- readRDS("outputs/GUR_PA_Enviro_List.rds")
+GUR_training_data <- readRDS("outputs/GUR_training_data.rds")
+```
+
+
+## Divide datasets into CV folds by spatial blocking
+```{r}
+gc()
+#Load all of the required scripts containing functions to do this
+source("CV_Functions_flexSDM.R")
+
+#Set the size of spatial blocks based on previously completed autocorrelation analysis
+Block_Size <-90000 #CODEEDIT to adjust block size for the species if needed 
+#Set the k-value for k-fold cross-validation: number of spatial folds
+k <- 10
+
+#Load in hindcast climatology #CODEEDIT select for only the variables I want included in my models
+Hindcast_Climatology <- terra::rast("./processed_data/ENV_layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif")
+Hindcast_Climatology <- terra::subset(Hindcast_Climatology, names(Hindcast_Climatology) != "Depth")
+
+#Turn the final training dataset into an sf object
+GUR_training_data_sf <- sf::st_as_sf(GUR_training_data, coords = c("x", "y"), crs = 3005)
+
+#Set seed
+set.seed(157)
+#Spatially block based on the optimal size suggested above
+GUR_training_blocks <- blockCV::cv_spatial(GUR_training_data_sf, column = "Occurrence", hexagon = FALSE, k = k+1, size = Block_Size, selection = "random", iteration = 200)
+
+#Add the training fold IDs to the dataset
+GUR_training_data$fold <- GUR_training_blocks$folds_ids
+GUR_training_data_sf$fold <- GUR_training_blocks$folds_ids
+
+#Check to see how many presence points ended up in each block
+Presence_summary <- terra::as.data.frame(GUR_training_data) %>% dplyr::group_by(fold) %>% dplyr::summarise(Presence_num = sum(Occurrence))
+
+#Adjust folds if needed by reshuffling presence points from folds with a number of presence points over some cutoff based on the total number of points in the dataset
+GUR_training_data_sf <- CV_redistribute_new(GUR_training_data_sf, k+1, 150) #adjust this cutoff to be reasonable based on the number of presence points and folds you are working with (the idea is to better balance presences within folds, but not to make things completely equal)
+GUR_training_data <- terra::vect(GUR_training_data_sf)
+GUR_training_data_df <- terra::as.data.frame(GUR_training_data)
+
+#Save the dataset for GUR
+write.csv(GUR_training_data_df, "./Generated_Data/Blocked_datasets/GUR_blocks.csv")
+terra::writeVector(GUR_training_data, "./processed_data/Blocked_Spatial_Data/GUR_blocks.shp", overwrite = TRUE)
+
+#Check to see how many presence points ended up in each block
+Presence_summary <- GUR_training_data_df %>% dplyr::group_by(fold) %>% dplyr::summarise(Presence_num = sum(Occurrence))
+Point_summary <- GUR_training_data_df %>% dplyr::group_by(fold) %>% dplyr::summarise(Point_num = n())
+
+#Merge the two data frames by the 'fold' column
+GUR_Point_numbers <- merge(Presence_summary, Point_summary, by = "fold")
+#Create the 'Absence_num' column
+#GUR_Point_numbers$Absence_num <- Point_numbers$Point_num - Point_numbers$Presence_num
+
+
+GUR_training_data_df <- GUR_training_data_df[!is.na(GUR_training_data_df$fold), ]
+GUR_training_data_sf <- GUR_training_data_sf[!is.na(GUR_training_data_sf$fold), ]
+
+#Look at the CAST plot to see how well folds represent predicting to the entire predictor space
+GUR_CAST_output <- CAST::geodist(x = GUR_training_data_sf, modeldomain = Hindcast_Climatology, type = "feature", cvfolds = GUR_training_data_sf$fold, samplesize = 2000, sampling = "random")
+GUR_CAST_plot <- ggplot() + geom_density(data = GUR_CAST_output, aes(x = dist, fill = what), alpha = 0.4) + 
+      theme_classic() + scale_fill_manual(values = c("#404788FF", "#238A8DFF", "#FDE725FF"), name = "Compared features") + 
+      ylab("Density") + xlab("Distance in feature space") + 
+      theme(legend.position = c(0.7,0.7)) + guides(x.sec = "axis", y.sec = "axis")+ 
+      theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank())
+
+GUR_CAST_plot
+ggsave2(filename = "./Plots/CAST_Plots/GUR_CAST_Plot.jpeg", plot = GUR_CAST_plot, scale = 1, height = 75, width = 100, units = "mm")
+```
+
+## Plot the environmental and geographic coverage of the dataset
+```{r}
+gc()
+#Load all scripts containing functions required for this step
+source("Predictor_Coverage_Plotter_flexSDM.R")
+source("PA_Map_Creator_flexSDM.R")
+
+#Calculate the number of predictors from one of the environmental dataframes
+Predictor_num <- ncol(Enviro_df_list[[1]]) 
+Predictor_num <- Predictor_num - 2
+
+#Plot the environmental coverage of presence and pseudo-absence datasets across all years and PA datasets compared to the overall environmental space
+GUR_Predictor_Coverage_Plot <- Enviro_plot(Enviro_df_long_list, GUR_training_data_df, Predictor_num)
+ggsave2(filename = "./Plots/Predictor_Coverage_Plots/GUR_Predictor_Plot.jpeg", plot = GUR_Predictor_Coverage_Plot, scale = 1, height = 400, width = 400, units = "mm")
+
+#Geographically plot presences and pseudo-absences for each PA dataset (all years together on same plot)
+GUR_PA_Map <- Geog_Plot_GUR(Land, GUR_training_data)
+ggsave("./Plots/PA_Geog_Plots/GUR_PA_Geog_Plot.jpeg", GUR_PA_Map, units = "mm", width = 120, height = 140)
+
+###
+#Build density plots comparing all variable ranges within presence points of each data fold
+###
+Fold_Predictor_Data_long <- dplyr::filter(GUR_training_data_df, Occurrence == 1)[,2:(Predictor_num+2)] %>% pivot_longer(cols = TAlk_10m_mean:Slope, values_to = "Value", names_to = "Predictor")
+Fold_Predictor_Data_long$fold <- as.factor(Fold_Predictor_Data_long$fold)
+
+Predictor_density_plot <- ggplot(Fold_Predictor_Data_long, aes(x = fold, y = Value, fill = fold)) + geom_violin(alpha = 0.8) + theme_cowplot() + facet_wrap(Predictor~., scales = "free") + theme(legend.position = "none", axis.text.x = element_text(), legend.title = element_text(size = 32), legend.text = element_text(size =28)) + ylab(NULL) + xlab(NULL) + theme(strip.background = element_blank(), strip.placement = "outside", strip.text = element_text(size=14)) + scale_fill_manual(values = c("#bfbfbf","#e76bf3", "#11b0f7", "#09c07c", "#a2a500", "#ffa32c", "#f8766d", "pink", "brown", "white", "black"))
+Predictor_density_plot
+ggsave2(filename = "./Plots/Density_Plots/GUR_Fold_Predictor_density_plot.jpeg", plot = Predictor_density_plot, scale = 1, height = 400, width = 400, units = "mm")
+```
+
+## Split the spatially blocked data into the k training folds and the k+1 final testing dataset
+```{r}
+
+
+#Create a final training df from the first k folds
+GUR_training_df <- GUR_training_data_df %>% dplyr::filter(fold != (k+1))
+
+#Create a final testing df from the K+1 fold
+GUR_testing_df <- GUR_training_data_df %>% dplyr::filter(fold == (k+1))
+
+
+```
+
+# Model Fitting
+
+## Fit an ensemble SDM to the training data
+```{r}
+gc()
+
+#BRT
+BRT_tune_grid <- expand.grid(
+  n.trees = c(1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2100, 2200),
+  shrinkage = c(0.05, 0.01, 0.005, 0.001, 0.0005),
+  n.minobsinnode = c(5, 10, 15, 20, 40))
+
+GUR_BRT <- flexsdm::tune_gbm(data = GUR_training_df, response = "Occurrence", predictors = colnames(GUR_training_data_df[2:(Predictor_num+1)]), partition = "fold", grid = BRT_tune_grid, thr = c("equal_sens_spec"), metric = "AUC", n_cores = 10)
+
+#MaxEnt
+Max_tune_grid <- expand.grid(
+  regmult = c(0.1, 0.5, 1, 2, 3, 5),
+  classes = c("l", "lq", "lqh"))
+
+GUR_max <- flexsdm::tune_max(data = GUR_training_df %>% dplyr::filter(Occurrence == 1), response = "Occurrence", predictors = colnames(GUR_training_data_df[2:(Predictor_num+1)]), partition = "fold", background = GUR_training_df %>% dplyr::filter(Occurrence == 0), grid = Max_tune_grid, thr = c("equal_sens_spec"), metric = "AUC", clamp = FALSE, pred_type = "cloglog", n_cores = 10)
+
+#GLM
+GUR_glm <- flexsdm::fit_glm(data = GUR_training_df, response = "Occurrence", predictors = colnames(GUR_training_data_df[2:(Predictor_num+1)]), select_pred = TRUE, partition = "fold", thr = c("equal_sens_spec"), poly = 1, inter_order = 0)
+
+#GAM
+GUR_gam <- flexsdm::fit_gam(data = GUR_training_df, response = "Occurrence", predictors = colnames(GUR_training_data_df[2:(Predictor_num+1)]), select_pred = TRUE, partition = "fold", thr = c("equal_sens_spec"), k = 3)
+
+# #RF
+# RF_tune_grid <- expand.grid(
+#   ntree = c(1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000, 2100, 2200),
+#   mtry = c(2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20))
+# GUR_RF <- flexsdm::tune_raf(data = GUR_training_df, response = "Occurrence", predictors = colnames(GUR_training_data_df[2:(Predictor_num+1)]), partition = "fold", grid = RF_tune_grid, thr = c("equal_sens_spec"), metric = "AUC", n_cores = 10)
+# 
+# #SVM
+# SVM_tune_grid <- expand.grid(
+#   C = c(2, 4, 6, 10, 15),
+#   sigma = c(0.001, 0.05, 0.1, 1, 3, 5, 10))
+# GUR_svm <- flexsdm::tune_svm(data = GUR_training_df, response = "Occurrence", predictors = colnames(GUR_training_data_df[2:(Predictor_num+1)]), partition = "fold", grid = SVM_tune_grid, thr = c("equal_sens_spec"), metric = "AUC", n_cores = 10)
+
+#Fit an ensemble of all methods
+GUR_ENS <- flexsdm::fit_ensemble(models = list(GUR_BRT, GUR_max, GUR_glm, GUR_gam), ens_method = "meanw", thr = c("equal_sens_spec"), thr_model = "equal_sens_spec", metric = "AUC")
+
+```
+
+# Model Evaluation and Prediction
+
+## For the final ensemble model, calculate metrics of model overfitting (Omission Error with a 10% omission threshold, and AUCdiff) and discriminatory ability (AUC), compare to null models.
+```{r}
+gc()
+#Load all scripts containing functions required during this step
+source("Model_Evaluation_flexSDM.R")
+source("Model_Evaluation_Plots_flexSDM.R")
+
+#create a dataframe of environmental conditions in cells within the survey buffer to be used when making random draws for null models using previously created Enviro_df_mask_list
+
+#Survey_Enviro_df <- Enviro_df_mask_list[[1]]
+#for (i in 2:length(Enviro_df_mask_list)){
+#  Survey_Enviro_df_mask <- rbind(Survey_Enviro_df_mask, Enviro_df_mask_list[[i]])
+#}
+
+#write.csv(Survey_Enviro_df_mask, "./Generated_data/Interim_datasets/GUR_Survey_Enviro_df_mask.csv", row.names = FALSE)
+
+Survey_Enviro_df <- Enviro_df_list[[1]]
+for (i in 2:length(Enviro_df_list)){
+  Survey_Enviro_df <- rbind(Survey_Enviro_df, Enviro_df_list[[i]])
+}
+
+
+#save 
+write.csv(Survey_Enviro_df, "./Generated_data/Interim_datasets/GUR_Survey_Enviro_df.csv", row.names = FALSE)
+
+GUR_Survey_Enviro_df <- Survey_Enviro_df
+
+Survey_Enviro_df <- Survey_Enviro_df %>% dplyr::select(-x,-y)
+
+#Evaluate models and 1000 null models for comparison
+#When depth is NOT included Predictor + 2, when depth is included PRedictor num + 1 (in Model_Eval function needs to change)
+GUR_Eval <- Model_Eval_NEW(GUR_ENS, GUR_training_df, GUR_testing_df, Survey_Enviro_df, GUR_BRT, GUR_max, GUR_glm, GUR_gam, Predictor_num)
+
+#Save the model evaluation and null evaluation dataframes as CSV files
+write.csv(GUR_Eval[[1]], "./Generated_Data/Evaluation_datasets/GUR_Eval.csv")
+write.csv(GUR_Eval[[2]], "./Generated_Data/Evaluation_datasets/GUR_Null.csv")
+
+
+#Plot the model and null model evaluation metrics
+GUR_Eval_Plot <- Eval_Plot(GUR_Eval)
+GUR_Eval_Plot
+ggsave2(filename = "./Plots/Eval_Plots/GUR_Eval_Plot.jpeg", plot = GUR_Eval_Plot, scale = 1, height = 75, width = 100, units = "mm")
+
+#Create and display the Standard Effect Size Plot for GUR
+GUR_SES_Plot <- Effect_Size_Plot(GUR_Eval)
+GUR_SES_Plot
+ggsave2(filename = "./Plots/SES_Plots/GUR_SES_Plot.jpeg", plot = GUR_SES_Plot, scale = 1, height = 75, width = 100, units = "mm")
+
+
+```
+
+#plotting null comparison
+```{r}
+#GUR_Null <- read.csv("./Generated_Data/Evaluation_datasets/GUR_Null -FINAL.csv")
+#GUR_Models <- read.csv("./Generated_Data/Evaluation_datasets/GUR_Eval.csv") 
+
+#make null metrics long 
+#Create long-form dataframes for the model and null model metrics for plotting
+#GUR_Null_long <- GUR_Null %>% pivot_longer(cols = c("AUC_Train", "AUC_Test", "AUCdiff", "OErr"), names_to = "Metric", 
+                                        #   values_to = "Value") %>% dplyr::select('Metric', 'Value')
+
+#GUR_Model_long <- GUR_Models %>% pivot_longer(cols = c("AUC_Train", "AUC_Test", "AUCdiff", "OErr"), names_to = "Metric", 
+#                                              values_to = "Value") %>% dplyr::select('Metric', 'Value')
+
+# Set factor level order
+#GUR_Null_long$Metric <- factor(GUR_Null_long$Metric, levels = c("AUC_Train", "AUC_Test", "AUCdiff", "OErr"))
+#GUR_Model_long$Metric <- factor(GUR_Model_long$Metric, levels = c("AUC_Train", "AUC_Test", "AUCdiff", "OErr"))
+
+#Plot the model and null model evaluation metrics
+#GUR_Eval_Plot <- ggplot() + geom_boxplot(data = GUR_Null_long, aes(x = Metric, y = Value, fill = Metric)) + 
+#  scale_fill_manual(values = c("#613f74", "#91B3B6", "#F4E76E", "#EDAF97"), labels = c("AUC train", "AUC test", "AUC diff", #"OErr")) + 
+#  stat_summary(data = GUR_Model_long, aes(x = Metric, y = Value), fun.y = mean, geom = "point", colour = "#e6360F", size = 3) #+ 
+ # xlab("Evaluation Metric") + ylab("Value") + theme_classic() + 
+#  guides(x.sec = "axis", y.sec = "axis")+ theme(axis.line.y.left = element_line(size = 0.75, color = "black"), axis.line.y.right = element_line(size = 0.75, color = "black"), axis.line.x.top = element_line(size = 0.75, color = "black"), axis.line.x.bottom = element_line(size = 0.75, color = "black"),axis.ticks.x.top = element_blank(), axis.ticks.x.bottom = element_blank(), axis.ticks.y.right = element_blank(), axis.text.x.top = element_blank(), axis.text.y.right = element_blank()) + 
+ # theme(legend.position = "none", legend.justification = "center") + 
+#  theme(axis.text = element_text(size=8), axis.title = element_text(size = 12))
+
+
+#GUR_Eval_Plot
+
+#ggsave2(filename = "./Plots/Eval_Plots/GUR_Eval_Plot -FINAL.jpeg", plot = GUR_Eval_Plot, scale = 1, height = 75, width = 100, units = "mm")
+
+```
+
+## Generate final model likelihood of occurrence (LO) predictions and associated uncertainty
+```{r}
+gc()
+#Load all scripts containing functions required during this step
+source("Model_Prediction_flexSDM_V2.R")
+source("Spatial_Mapping_Functions_flexSDM.R")
+
+#Generate final LO predictions and uncertainty metrics
+GUR_Outputs <- Prediction(GUR_ENS, GUR_training_df, Hindcast_Climatology, GUR_BRT, GUR_max, GUR_glm, GUR_gam, k, Predictor_num)
+
+#Save the overall predictions and Uncertainty to raster layers for examination
+terra::writeRaster(GUR_Outputs[[1]], "./processed_data/LO_Predictions/GUR_LO_Predictions.tif", overwrite = TRUE)
+#terra::writeRaster(GUR_Outputs[[2]], "./processed_data/Uncertainty/GUR_Overall_Uncertainty.tif", overwrite = TRUE)
+terra::writeRaster(GUR_Outputs[[2]], "./processed_data/Uncertainty/GUR_Method_Uncertainty.tif", overwrite = TRUE)
+#terra::writeRaster(GUR_Outputs[[4]], "./processed_data/Uncertainty/GUR_CV_Uncertainty.tif", overwrite = TRUE)
+
+#Generate maps of these metrics
+
+#Create a map for the overall predictions as percent likelihood of occurrence for present day
+GUR_Overall_Predicitions_Plot <- RC_Map(GUR_Outputs[[1]], "Likelihood of \nOccurence", "meanw", Land)
+ggsave2(filename = "./Plots/Maps/LO_Plots/GUR_LO_Map.jpeg", plot = GUR_Overall_Predicitions_Plot, scale = 1, height = 140, width = 115, units = "mm")
+#Create maps for each individual uncertainty metric
+#GUR_Uncertainty_Plot <- RC_Map(GUR_Outputs[[2]], "Overall\nPrediction\nUncertainty", "std", Land)
+#ggsave2(filename = "./Plots/Maps/Uncertainty_Plots/GUR_Overall_Uncertainty_Map.jpeg", plot = GUR_Uncertainty_Plot, scale = 1, height = 140, width = 115, units = "mm")
+GUR_Method_Uncertainty_Plot <- RC_Map(GUR_Outputs[[2]], "Model\nUncertainty", "gbm", Land)
+ggsave2(filename = "./Plots/Maps/Uncertainty_Plots/GUR_Model_Uncertainty_Map.jpeg", plot = GUR_Method_Uncertainty_Plot, scale = 1, height = 140, width = 115, units = "mm")
+
+#GUR_CV_Uncertainty_Plot <- RC_Map(GUR_Outputs[[4]], "CV\nUncertainty", "std", Land)
+#ggsave2(filename = "./Plots/Maps/Uncertainty_Plots/GUR_CV_Uncertainty_Map.jpeg", plot = GUR_CV_Uncertainty_Plot, scale = 1, height = 140, width = 115, units = "mm")
+```
+
+## Determine the optimal threshold for converting (LO) predictions to binary presence/absence and convert
+```{r}
+#Load all scripts containing functions required during this step
+source("Binary_Prediction_flexSDM.R")
+
+#Create an overall binary prediction layer
+GUR_Thresholds <- Optimize_Threshold(GUR_training_data_df, GUR_BRT, GUR_max, GUR_glm, GUR_gam)
+GUR_Thresholds[[1]]
+#Save the Threshold Plot
+ggsave2(filename = "./Plots/Threshold_Plots/GUR_Threshold_Plot.jpeg", plot = GUR_Thresholds[[1]], scale = 1, height = 100, width = 150, units = "mm")
+
+#For GUR it appears that the optimal threshold is the optimal TSS threshold as this also keeps an omission error of 0 for the overall model
+GUR_Optimal_Threshold <- GUR_Thresholds[[2]]
+
+#Save the threshold data to a csv file for use when adjusting thresholds later
+write.csv(GUR_Thresholds[[9]], "./Generated_Data/Threshold_datasets/GUR_Thresholds.csv")
+write.csv(GUR_Thresholds[[4]], "./Generated_Data/Prediction_datasets/GUR_Predictions.csv")
+
+#Read the predictions back in for use in plotting
+GUR_Prediction_dataset <- read.csv("./Generated_Data/Prediction_datasets/GUR_Predictions.csv")
+
+#Create a density plot of false TP, FP, TN, FN
+GUR_Density_Plot <- Density_Plot(GUR_Prediction_dataset, GUR_Optimal_Threshold)
+GUR_Density_Plot
+ggsave2(filename = "./Plots/Density_Plots/GUR_Density_Plot.jpeg", plot = GUR_Density_Plot, scale = 1, height = 150, width = 225, units = "mm")
+#Create the final binary prediction layer
+GUR_Binary_Predictions <- GUR_Outputs[[1]] >= GUR_Optimal_Threshold
+#Save this raster 
+terra::writeRaster(GUR_Binary_Predictions, "./processed_data/Binary_Predictions/GUR_Binary_Predictions.tif", overwrite = TRUE)
+gc()
+
+#Generate a map of the final binary predictions
+#Create a map of present day PA predictions 
+GUR_PA_Plot <- RD_Map_GUR(GUR_Binary_Predictions, "Green \nurchin", Land)
+ggsave2(filename = "./Plots/Maps/Binary_Occurence_Plots/GUR_Binary_Predictions_Map.jpeg", plot = GUR_PA_Plot, scale = 1, height = 140, width = 115, units = "mm")
+```
+
+# Model/Predictor Interpretation
+
+## Assess variable imporatance using the evaluation strip method and relative importance 
+```{r}
+#Load all scripts containing functions required during this step
+source("Predictor_Importance_flexSDM.R")
+source("Predictor_Evaluation_Strip_flexSDM.R")
+
+###
+#Variable Importance
+###
+
+#Calculate relative predictor importance and generate plots representing this and aggregated importance for larger predictor classes
+GUR_Pred_Imp <- Predictor_Importance_GUR(GUR_ENS, GUR_training_df, Predictor_num)
+
+#Save a copy of the predictor importance dataframe in case needed later
+write.csv(GUR_Pred_Imp[[1]],"./Generated_Data/Predictor_Importance_datasets/GUR_Predictor_Importance.csv")
+#Save the plots
+ggsave2(filename = "./Plots/PI_Plots/GUR_PI_Plot.jpeg", plot = GUR_Pred_Imp[[2]], scale = 1, height = 200, width = 175, units = "mm")
+ggsave2(filename = "./Plots/PI_Plots/GUR_Class_PI_Plot.jpeg", plot = GUR_Pred_Imp[[3]], scale = 1, height = 200, width = 175, units = "mm")
+gc()
+
+###
+#Set up for evaluation strip
+###
+
+#Set up dataframes for performing the evaluation strip method for any Urchin species 
+Hindcast_df <- terra::as.data.frame(terra::rast("./processed_data/ENV_Layers/BCCM_Rasters/Predictor_Hindcast_Climatologies_2012-2023.tif")) %>% na.omit() 
+
+Hindcast_df <- Hindcast_df[, !names(Hindcast_df) %in% "Depth"]
+
+
+gc()
+#Calculate the means for each environmental variable
+Enviro_Means <- colMeans(Hindcast_df)
+#Calculate the max and min for each variable
+Enviro_Max <- colMax(Hindcast_df)
+Enviro_Min <- colMin(Hindcast_df)
+
+#Create a dataframe for prediction to occur onto for each of the predictor variables of interest.
+#Set up a base dataframe
+Evaluation_Strip_Base <- data.frame()
+Evaluation_Strip_Base_Max <- data.frame()
+Evaluation_Strip_Base_Min <- data.frame()
+for (i in 1:1000){
+  Evaluation_Strip_Base[i,1:ncol(Hindcast_df)] <- Enviro_Means
+  Evaluation_Strip_Base_Max[i,1:ncol(Hindcast_df)] <- Enviro_Max
+  Evaluation_Strip_Base_Min[i,1:ncol(Hindcast_df)] <- Enviro_Min
+}
+#name the dataframe columns
+colnames(Evaluation_Strip_Base) <- colnames(Hindcast_df)
+colnames(Evaluation_Strip_Base_Max) <- colnames(Hindcast_df)
+colnames(Evaluation_Strip_Base_Min) <- colnames(Hindcast_df)
+
+#Set up a dataframe where values ranging the full environmental conditions for each variable are stored
+Evaluation_Strip_Range <- Evaluation_Strip_Base
+for (i in 1:ncol(Evaluation_Strip_Range)){
+  Evaluation_Strip_Range[,i] <- seq(from = Enviro_Min[i], to = Enviro_Max[i], length.out = 1000)
+}
+
+###
+#Evaluation Strip
+###
+
+#Create predictions for each variable all others held at their mean, max, and min value using evaluation strip
+GUR_ES_Preds <- ES_Predictions(Hindcast_df, Evaluation_Strip_Base, Evaluation_Strip_Base_Max, Evaluation_Strip_Base_Min, Evaluation_Strip_Range, GUR_BRT, GUR_max, GUR_glm, GUR_gam)
+#Save ES predictions for later use
+write.csv(GUR_ES_Preds,"./Generated_Data/ES_datasets/GUR_ES_Preds.csv")
+
+#Define a list of names for all of the predictor variables to be used by the evaluation strip plotting function
+Predictor_Names <- c("Talkbmax (mEq/m^3)", "Sbmean (PSU)", "Sbmin (PSU)","Tsmean (\u00B0C)", "Tsmax (\u00B0C)", "Tsmin (\u00B0C)", "Tbmean (\u00B0C)", "Tbmax (\u00B0C)", "Tbmin (\u00B0C)", "Oxybmean (mmol/m^3)", "Oxybmin (mmol/m^3)", "Current (m/s)", "REI", "Percent Rock", "Slope (deg)") #CODEEDIT: change this based on the predictors being used
+Predictor_IDs <- names(Hindcast_Climatology)
+#Create all of the evaluation strip plots for my environmental variables
+GUR_ES_Plots <- list()
+GUR_ES_Plots_All <- list()
+for(i in 1:length(Predictor_IDs)){
+  ES_Plots_Temp <- ES_Plotter(GUR_ES_Preds, Predictor_IDs[i], Predictor_Names[i])
+  ggsave2(filename = paste0("./Plots/ES_Plots/GUR/GUR_", Predictor_IDs[i],"_ES_Plot.jpeg"), plot = ES_Plots_Temp[[1]], scale = 1, height = 150, width = 225, units = "mm")
+  ggsave2(filename = paste0("./Plots/ES_Plots/GUR/GUR_", Predictor_IDs[i],"_All_ES_Plot.jpeg"), plot = ES_Plots_Temp[[2]], scale = 1, height = 150, width = 225, units = "mm")
+  GUR_ES_Plots[[i]] <- ES_Plots_Temp[[1]]
+  GUR_ES_Plots_All[[i]] <- ES_Plots_Temp[[2]]
+}
+
+#Create a plot of all ES Plots
+GUR_ES_Plot_Grid <- do.call(grid.arrange, c(GUR_ES_Plots, list(ncol = 5)))
+ggsave2(filename = "./Plots/ES_Plots/GUR_ES_Plot.jpeg", plot = GUR_ES_Plot_Grid, scale = 1, height = 450, width = 500, units = "mm")
+
+gc()
+```
+
+## Create predictor masks for GUR current day predictions based on where predictors are extrapolated beyond the training dataset
+```{r}
+#Create layers of a continuous extrapolation score and a binary yes/no of extrapolation
+GUR_Extrap <- extra_eval(training_data = GUR_training_df, pr_ab = "Occurrence", projection_data = Hindcast_Climatology, univar_comb = TRUE, n_cores = 1)
+#Adjust these to have NA values where they should
+Mask_Mult <- Hindcast_Climatology$REI*0+1
+GUR_Extrap_Continuous <- GUR_Extrap$extrapolation$extrapolation*Mask_Mult
+GUR_Extrap_Discrete <- GUR_Extrap$uni_comb$uni_comb*Mask_Mult
+#Save the layers
+terra::writeRaster(GUR_Extrap_Continuous, "./processed_data/Extrapolation_Masks/GUR_Continuous_Mask.tif", overwrite = TRUE)
+terra::writeRaster(GUR_Extrap_Discrete, "./processed_data/Extrapolation_Masks/GUR_Discrete_Mask.tif", overwrite = TRUE)
+
+#Create maps of these extrapolation masks
+GUR_Continuous_Mask_Plot <- RC_Map(GUR_Extrap_Continuous, "Degree of\nExtrapolation", "extrapolation", Land)
+ggsave2(filename = "./Plots/Maps/Mask_Plots/GUR_Continuous_Mask_Map.jpeg", plot = GUR_Continuous_Mask_Plot, scale = 1, height = 140, width = 115, units = "mm")
+GUR_Discrete_Mask_Plot <- ggplot(Land) + geom_sf() + geom_raster(data = as.factor(GUR_Extrap_Discrete), mapping = aes(x = x, y=y, fill = uni_comb)) + coord_sf(crs = st_crs(3005)) + annotation_scale(location = "bl", width_hint = 0.5) + annotation_north_arrow(location = "bl", which_north = "true", pad_x = unit(0.01, "in"), pad_y = unit(0.25, "in"), style = north_arrow_fancy_orienteering) + theme_cowplot() + xlim(c(650000, 890000)) + ylim(c(780000, 1225000)) + scale_fill_manual(values = c("#613f74","#F4E76E"), na.value = NA, name = element_blank(), labels = c("Not Extrapolated","Extrapolated"), na.translate = F) + xlab(element_blank()) + ylab(element_blank()) + theme(legend.position = c(0.6,0.9), legend.title=element_text(size=11), legend.text = element_text(size=10), legend.text.align = 0, legend.title.align = 0) + 
+theme(panel.background = element_rect(fill = "#878c8c"))
+ggsave2(filename = "./Plots/Maps/Mask_Plots/GUR_Discrete_Mask_Map.jpeg", plot = GUR_Discrete_Mask_Plot, scale = 1, height = 140, width = 115, units = "mm")
+```
